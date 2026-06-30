@@ -1,0 +1,51 @@
+;
+; WireDogSplitTunnel.inf - Installation file for WireDog Split Tunnel Driver
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = WFPCALLOUTS
+ClassGuid   = {57465043-616C-6C6F-7574-5F636C617373}
+Provider    = %ProviderString%
+CatalogFile = WireDogSplitTunnel.cat
+DriverVer   = 03/09/2026,1.0.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir          = 13  ; Driver Store
+WireDogSplitTunnel.Files = 13
+
+[DefaultInstall.NT$ARCH$]
+CopyFiles = WireDogSplitTunnel.Files
+
+[DefaultInstall.NT$ARCH$.Services]
+AddService = WireDogSplitTunnel,,WireDogSplitTunnel.Service
+
+[DefaultUninstall.NT$ARCH$]
+LegacyUninstall = 1
+
+[DefaultUninstall.NT$ARCH$.Services]
+DelService = WireDogSplitTunnel,0x200  ; SPSVCINST_STOPSERVICE
+
+[WireDogSplitTunnel.Service]
+DisplayName    = %ServiceName%
+Description    = %ServiceDesc%
+ServiceBinary  = %13%\WireDogSplitTunnel.sys
+ServiceType    = 1  ; SERVICE_KERNEL_DRIVER
+StartType      = 3  ; SERVICE_DEMAND_START
+ErrorControl   = 1  ; SERVICE_ERROR_NORMAL
+
+[WireDogSplitTunnel.Files]
+WireDogSplitTunnel.sys
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+WireDogSplitTunnel.sys = 1
+
+[Strings]
+ProviderString = "WireDog VPN"
+ServiceName    = "WireDog Split Tunnel Driver"
+ServiceDesc    = "WFP callout driver for per-app split tunneling"
+DiskName       = "WireDog Split Tunnel Installation Disk"

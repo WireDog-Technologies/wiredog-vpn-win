@@ -1,0 +1,62 @@
+{
+  "appId": "com.wiredog.vpn",
+  "productName": "WireDog VPN",
+  "directories": {
+    "output": "release"
+  },
+  "files": [
+    "dist/**/*",
+    "electron/**/*",
+    "node_modules/**/*",
+    "package.json"
+  ],
+  "extraResources": [
+    {
+      "from": ".env",
+      "to": ".env"
+    },
+    {
+      "from": "public/favicon.ico",
+      "to": "favicon.ico"
+    },
+    {
+      "from": "public/favicon-disconnected.png",
+      "to": "favicon-disconnected.png"
+    },
+    {
+      "from": "public/favicon-connected.png",
+      "to": "favicon-connected.png"
+    },
+    {
+      "from": "service/WireDog.Service/bin/Release/net8.0-windows/win-${arch}/publish",
+      "to": "service"
+    }
+  ],
+  "win": {
+    "icon": "public/favicon-256x256.png",
+    "target": [
+      {
+        "target": "nsis",
+        "arch": ["x64", "arm64"]
+      },
+      {
+        "target": "zip",
+        "arch": ["x64", "arm64"]
+      }
+    ],
+    "verifyUpdateCodeSignature": false
+  },
+  "nsis": {
+    "artifactName": "WireDog-VPN-Setup-${version}-${arch}.${ext}",
+    "oneClick": true,
+    "perMachine": true,
+    "installerIcon": "public/favicon.ico",
+    "uninstallerIcon": "public/favicon.ico",
+    "installerHeaderIcon": "public/favicon.ico",
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "shortcutName": "WireDog VPN",
+    "include": "build/installer.nsh",
+    "runAfterFinish": true
+  }
+}

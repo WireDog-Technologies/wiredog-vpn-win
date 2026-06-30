@@ -1,0 +1,150 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependencies
+node_modules
+.pnp
+.pnp.js
+
+# Build outputs
+dist
+dist-ssr
+dist-electron
+release/
+out/
+build/
+
+docs/
+tasks/todo.md
+
+# Package manager lock files (keep only one)
+bun.lockb
+yarn.lock
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.development
+.env.test.local
+.env.production.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Electron specific
+app/dist/
+build/Release/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Coverage directory used by tools like istanbul
+coverage
+*.lcov
+
+# nyc test coverage
+.nyc_output
+
+# ESLint cache
+.eslintcache
+
+# Optional npm cache directory
+.npm
+
+# Optional REPL history
+.node_repl_history
+
+# Output of 'npm pack'
+*.tgz
+
+# Yarn Integrity file
+.yarn-integrity
+
+# dotenv environment variables file
+.env.test
+
+# parcel-bundler cache (https://parceljs.org/)
+.parcel-cache
+
+# next.js build output
+.next
+
+# nuxt.js build output
+.nuxt
+
+# vuepress build output
+.vuepress/dist
+
+# Serverless directories
+.serverless
+
+# FuseBox cache
+.fusebox/
+
+# DynamoDB Local files
+.dynamodb/
+
+# TernJS port file
+.tern-port
+
+# Stores VSCode versions used for testing VSCode extensions
+.vscode-test
+
+# Temporary folders
+tmp/
+temp/
+
+# Custom project files (development only)
+plan.md
+CLAUDE.md
+ELECTRON_README.md
+.claude
+tasks/
+research/
+.vs/
+
+# Sensitive configuration files
+build/cert.p12
+config/keys.json
+secrets.json
+
+# .NET / C# build artifacts
+service/**/bin/
+service/**/obj/
+service/**/*.user
+service/**/.vs/
+service/**/.vscode/
+service/**/publish/
+service/logs/
+*.nupkg
+*.snupkg
+
+# WDK kernel driver build artifacts (exclude compiled binaries except .sys needed for packaging)
+service/WireDog.SplitTunnel/x64/Debug/*.pdb
+service/WireDog.SplitTunnel/x64/Debug/*.obj
+service/WireDog.SplitTunnel/x64/Debug/*.recipe
+service/WireDog.SplitTunnel/x64/Debug/*.vcxproj.FileListAbsolute.txt
+service/WireDog.SplitTunnel/x64/Debug/WireDogS.E3A1B2C3.tlog/
