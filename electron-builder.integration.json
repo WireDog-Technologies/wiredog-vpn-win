@@ -1,0 +1,10 @@
+{
+  "extends": "./electron-builder.json",
+  "artifactName": "WireDog-VPN-Test-${version}-${arch}.${ext}",
+  "win": {
+    "sign": "./build/noSign.js"
+  },
+  "nsis": {
+    "artifactName": "WireDog-VPN-Test-${version}-${arch}.${ext}"
+  }
+}

@@ -146,7 +146,7 @@ const ServerNode: React.FC<ServerNodeProps> = ({ server, isActive, isConnecting,
 
 
 const USMap: React.FC = () => {
-  const { connection, connect, disconnect, selectedServer, setSelectedServer, isSubscriptionActive } = useVPN();
+  const { connection, connect, cancelConnect, disconnect, selectedServer, setSelectedServer, selectServer, isSwitchingServer, isSubscriptionActive } = useVPN();
   const { data: servers = [] } = useServersWithLatency();
   const { data: recommendedServers = [] } = useRecommendedServers();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -164,8 +164,11 @@ const USMap: React.FC = () => {
 
   const cityServers = useMemo(() => getServersByCity(servers), [servers]);
 
-  const isConnected = connection.status === 'connected';
-  const isConnecting = connection.status === 'connecting';
+  const isConnected = connection.status === 'connected' && !isSwitchingServer;
+  // Includes isSwitchingServer so the brief disconnect->connect gap mid-switch (which
+  // connection.status genuinely passes through as 'disconnected') doesn't flicker the UI
+  // back to an idle/connectable state.
+  const isConnecting = connection.status === 'connecting' || isSwitchingServer;
 
   // Set default server on mount (first recommended server)
   useEffect(() => {
@@ -266,9 +269,10 @@ const USMap: React.FC = () => {
     return () => window.removeEventListener('resize', updateSvgBounds);
   }, [updateSvgBounds]);
 
-  // Handle server selection (clicking on map node)
+  // Handle server selection (clicking on map node) — quick-switches immediately if already
+  // connected/connecting to a different server (see VPNContext.selectServer).
   const handleSelect = (server: ServerLocation) => {
-    setSelectedServer(server);
+    selectServer(server);
   };
 
   // Handle connect button click
@@ -281,6 +285,11 @@ const USMap: React.FC = () => {
   // Handle disconnect button click
   const handleDisconnect = async () => {
     await disconnect();
+  };
+
+  // Handle cancel button click (shown in place of Connect while connecting/reconnecting)
+  const handleCancelConnect = async () => {
+    await cancelConnect();
   };
 
   return (
@@ -334,6 +343,7 @@ const USMap: React.FC = () => {
             connectedServer={connection.server}
             isSubscriptionActive={isSubscriptionActive}
             onConnect={handleConnect}
+            onCancelConnect={handleCancelConnect}
             onDisconnect={handleDisconnect}
             speedData={speedData}
           />

@@ -1,47 +1,8 @@
 import React, { createContext, useContext, useEffect, useState, ReactNode } from 'react';
 
-// Extend the Window interface to include our electronAPI
-declare global {
-  interface Window {
-    electronAPI: {
-      minimizeWindow: () => Promise<void>;
-      maximizeWindow: () => Promise<void>;
-      closeWindow: () => Promise<void>;
-      quitApp: () => Promise<void>;
-      getAppVersion: () => Promise<string>;
-      getBuildNumber: () => Promise<number>;
-      isWindowMaximized: () => Promise<boolean>;
-      openExternal: (url: string) => Promise<boolean>;
-      connectVPN: (serverId: string) => Promise<{ success: boolean; serverId: string }>;
-      disconnectVPN: () => Promise<{ success: boolean }>;
-      getSettings: () => Promise<any>;
-      setSettings: (settings: any) => Promise<boolean>;
-      getOsVersion: () => Promise<string>;
-      logs: {
-        openAppLogs: () => Promise<void>;
-        openServiceLogs: () => Promise<void>;
-      };
-      update: {
-        signalReady: () => Promise<void>;
-        checkForUpdates: () => Promise<{ upToDate: boolean }>;
-        downloadUpdate: () => Promise<void>;
-        installUpdate: () => void;
-        onAvailable: (callback: (data: any) => void) => () => void;
-        onDownloaded: (callback: (data: any) => void) => () => void;
-        onForceRequired: (callback: (data: any) => void) => () => void;
-        onMaintenance: (callback: (data: any) => void) => () => void;
-        onDownloadProgress: (callback: (data: any) => void) => () => void;
-      };
-      onUpdateAvailable: (callback: () => void) => () => void;
-      onUpdateDownloaded: (callback: () => void) => () => void;
-      platform: string;
-      isMac: boolean;
-      isWindows: boolean;
-      isLinux: boolean;
-      isDev: boolean;
-    };
-  }
-}
+// Window.electronAPI's type is declared once, in src/types/vpn.ts (imported wherever needed
+// via the ambient `declare global` there) — no separate declaration here to avoid the two
+// drifting out of sync with each other and with the real shape electron/preload.js exposes.
 
 interface ElectronContextType {
   // Window controls
@@ -54,13 +15,9 @@ interface ElectronContextType {
   // System operations
   openExternal: (url: string) => Promise<boolean>;
 
-  // VPN operations
-  connectVPN: (serverId: string) => Promise<{ success: boolean; serverId: string }>;
-  disconnectVPN: () => Promise<{ success: boolean }>;
-
   // Settings
-  getSettings: () => Promise<any>;
-  setSettings: (settings: any) => Promise<boolean>;
+  getSettings: () => Promise<Record<string, unknown>>;
+  setSettings: (settings: Record<string, unknown>) => Promise<boolean>;
 
   // System info
   getOsVersion: () => Promise<string>;
@@ -68,10 +25,6 @@ interface ElectronContextType {
   // Logs
   openAppLogs: () => Promise<void>;
   openServiceLogs: () => Promise<void>;
-
-  // Update events
-  onUpdateAvailable: (callback: () => void) => () => void;
-  onUpdateDownloaded: (callback: () => void) => () => void;
 
   // Platform info
   platform: string;
@@ -99,12 +52,8 @@ const mockElectronAPI = {
   },
   isWindowMaximized: async () => false,
   openExternal: async (url: string) => { window.open(url, '_blank'); return true; },
-  connectVPN: async (serverId: string) => ({ success: true, serverId }),
-  disconnectVPN: async () => ({ success: true }),
   getSettings: async () => ({ autoStart: false, killSwitch: true, notifications: true }),
   setSettings: async () => true,
-  onUpdateAvailable: () => () => {},
-  onUpdateDownloaded: () => () => {},
   platform: 'web',
   isMac: false,
   isWindows: false,
@@ -120,8 +69,11 @@ export const ElectronProvider: React.FC<{ children: ReactNode }> = ({ children }
     setIsElectron(!!window.electronAPI);
   }, []);
 
-  // Use real electronAPI if available, otherwise use mock
-  const electronAPI = isElectron ? window.electronAPI : mockElectronAPI;
+  // Use real electronAPI if available, otherwise use mock. Checked together with isElectron
+  // (rather than just isElectron ? window.electronAPI : mock) so TS can narrow
+  // window.electronAPI's type here — it can't follow that isElectron implies electronAPI is
+  // defined, since that fact was established by a separate state update in the effect above.
+  const electronAPI = isElectron && window.electronAPI ? window.electronAPI : mockElectronAPI;
 
   const value: ElectronContextType = {
     minimizeWindow: electronAPI.minimizeWindow,
@@ -133,12 +85,8 @@ export const ElectronProvider: React.FC<{ children: ReactNode }> = ({ children }
     openExternal: electronAPI.openExternal,
     openAppLogs: electronAPI.logs?.openAppLogs || (async () => {}),
     openServiceLogs: electronAPI.logs?.openServiceLogs || (async () => {}),
-    connectVPN: electronAPI.connectVPN,
-    disconnectVPN: electronAPI.disconnectVPN,
     getSettings: electronAPI.getSettings,
     setSettings: electronAPI.setSettings,
-    onUpdateAvailable: electronAPI.onUpdateAvailable,
-    onUpdateDownloaded: electronAPI.onUpdateDownloaded,
     platform: electronAPI.platform,
     isMac: electronAPI.isMac,
     isWindows: electronAPI.isWindows,

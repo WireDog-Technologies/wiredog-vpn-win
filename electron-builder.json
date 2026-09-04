@@ -36,17 +36,16 @@
     "icon": "public/favicon-256x256.png",
     "target": [
       {
-        "target": "nsis",
-        "arch": ["x64", "arm64"]
+        "target": "nsis"
       },
       {
-        "target": "zip",
-        "arch": ["x64", "arm64"]
+        "target": "zip"
       }
     ],
     "sign": "./customSign.js",
     "signDlls": true,
-    "verifyUpdateCodeSignature": false
+    "verifyUpdateCodeSignature": false,
+    "signingHashAlgorithms": ["sha256"]
   },
   "nsis": {
     "artifactName": "WireDog-VPN-Setup-${version}-${arch}.${ext}",

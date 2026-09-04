@@ -1,7 +1,7 @@
 import { ServerLocation } from '@/types/vpn';
 
 export const servers: ServerLocation[] = [
-  { id: 'ny-1', state: 'New York', stateCode: 'NY', city: 'New York City', latitude: 40.7128, longitude: -74.006, latency: 0, load: 45, recommended: true, host: '' },
+  { id: 'ny-1', state: 'New York', stateCode: 'NY', city: 'New York', latitude: 40.7128, longitude: -74.006, latency: 0, load: 45, recommended: true, host: '' },
   { id: 'ca-1', state: 'California', stateCode: 'CA', city: 'Los Angeles', latitude: 34.0522, longitude: -118.2437, latency: 0, load: 62, host: '' },
   { id: 'ca-2', state: 'California', stateCode: 'CA', city: 'San Francisco', latitude: 37.7749, longitude: -122.4194, latency: 0, load: 38, recommended: true, host: '' },
   { id: 'tx-1', state: 'Texas', stateCode: 'TX', city: 'Dallas', latitude: 32.7767, longitude: -96.797, latency: 0, load: 55, host: '' },

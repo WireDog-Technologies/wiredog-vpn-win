@@ -20,6 +20,7 @@ import SettingsConnection from "./pages/SettingsConnection";
 import SettingsProtocol from "./pages/SettingsProtocol";
 import SettingsKillSwitch from "./pages/SettingsKillSwitch";
 import SettingsIPv6 from "./pages/SettingsIPv6";
+import SettingsGuardianMode from "./pages/SettingsGuardianMode";
 import SettingsSplitTunneling from "./pages/SettingsSplitTunneling";
 import SplitTunnelApps from "./pages/SplitTunnelApps";
 import SplitTunnelIPs from "./pages/SplitTunnelIPs";
@@ -59,6 +60,7 @@ const AppRoutes: React.FC = () => {
         <Route path="/settings/protocol" element={<SettingsProtocol />} />
         <Route path="/settings/kill-switch" element={<SettingsKillSwitch />} />
         <Route path="/settings/ipv6" element={<SettingsIPv6 />} />
+        <Route path="/settings/guardian-mode" element={<SettingsGuardianMode />} />
         <Route path="/settings/split-tunneling" element={<SettingsSplitTunneling />} />
         <Route path="/settings/split-tunneling/apps" element={<SplitTunnelApps />} />
         <Route path="/settings/split-tunneling/ips" element={<SplitTunnelIPs />} />

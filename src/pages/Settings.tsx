@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Power, Split, User, Bell, ChevronLeft, Globe, RotateCcw, Download, Loader2, CheckCircle } from 'lucide-react';
+import { Power, Split, User, Bell, ChevronLeft, Globe, RotateCcw, Download, Loader2, CheckCircle, ShieldCheck } from 'lucide-react';
 import { GiCardExchange } from 'react-icons/gi';
 import { TbPlugConnected } from 'react-icons/tb';
 import { useNavigate } from 'react-router-dom';
@@ -38,6 +38,8 @@ const Settings: React.FC = () => {
       splitTunneling: { enabled: false, mode: 'exclude', apps: [], ips: [] },
       ipv6Enabled: true,
       ipv6LeakProtection: true,
+      blockAdsEnabled: true,
+      blockMalwareEnabled: true,
     });
 
     // Reset electron settings
@@ -150,6 +152,25 @@ const Settings: React.FC = () => {
                 </div>
               </div>
             </div>
+
+            <Separator />
+
+            {/* Guardian Mode */}
+            <button
+              onClick={() => navigate('/settings/guardian-mode')}
+              className="w-full flex items-center justify-between p-3 -m-3 rounded-lg hover:bg-muted/50 transition-colors"
+            >
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-lg bg-muted flex items-center justify-center">
+                  <ShieldCheck className="w-5 h-5 text-muted-foreground" />
+                </div>
+                <div className="text-left">
+                  <p className="font-medium leading-tight">Guardian Mode</p>
+                  <p className="text-sm text-muted-foreground leading-tight">Block ads and malware at the DNS level</p>
+                </div>
+              </div>
+              <ChevronLeft className="w-5 h-5 text-muted-foreground rotate-180" />
+            </button>
 
             <Separator />
 

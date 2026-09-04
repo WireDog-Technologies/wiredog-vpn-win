@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { CheckCircle, AlertTriangle, Copy, Loader2, ArrowLeft } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -18,8 +18,17 @@ const AnonymousAccount: React.FC = () => {
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
+  const isCreatingRef = useRef(false);
 
   const createAccount = async () => {
+    // Guards against a duplicate account being created: the mount effect below can fire more
+    // than once (React StrictMode, Fast Refresh, or a remount), and without a synchronous
+    // guard here, a second concurrent call mints a second, unrelated account. A ref is used
+    // rather than the isCreating state because state reads inside this function can be stale
+    // across React's batched updates; a ref mutates immediately.
+    if (isCreatingRef.current || accountNumber) return;
+    isCreatingRef.current = true;
+
     setIsCreating(true);
     setError('');
     try {
@@ -30,6 +39,7 @@ const AnonymousAccount: React.FC = () => {
       setError(err?.message || 'Failed to create account. Please try again.');
     } finally {
       setIsCreating(false);
+      isCreatingRef.current = false;
     }
   };
 

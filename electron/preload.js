@@ -43,6 +43,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // VPN operations
   vpn: {
     connect: (serverId, settings) => ipcRenderer.invoke('vpn:connect', { serverId, settings }),
+    cancelConnect: () => ipcRenderer.invoke('vpn:cancel-connect'),
     disconnect: (options) => ipcRenderer.invoke('vpn:disconnect', options),
     getStatus: () => ipcRenderer.invoke('vpn:get-status'),
     getStats: () => ipcRenderer.invoke('vpn:get-stats'),

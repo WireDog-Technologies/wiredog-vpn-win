@@ -48,6 +48,11 @@ export interface VPNSettings {
   splitTunneling: SplitTunnelingConfig;
   ipv6Enabled?: boolean;
   ipv6LeakProtection?: boolean;
+  // Guardian Mode — DNS-level ad/malware blocking, resolved server-side per connection
+  // (see resolveDnsAddresses in the backend's vpn.ts) based on these two flags sent with
+  // every /vpn/connect request.
+  blockAdsEnabled?: boolean;
+  blockMalwareEnabled?: boolean;
 }
 
 export interface User {
@@ -80,6 +85,7 @@ export interface VPNStatusUpdate {
   killSwitchEnabled: boolean;
   advancedKillSwitchEnabled?: boolean;
   advancedKillSwitchActive?: boolean;
+  isReconnecting?: boolean;
 }
 
 export interface VPNStats {
@@ -93,6 +99,7 @@ declare global {
     electronAPI?: {
       vpn: {
         connect: (serverId: string, settings: VPNSettings) => Promise<VPNConnectionResult>;
+        cancelConnect: () => Promise<{ success: boolean }>;
         disconnect: (options?: { disableProtection?: boolean }) => Promise<{ success: boolean }>;
         getStatus: () => Promise<VPNStatusUpdate>;
         getStats: () => Promise<VPNStats | null>;
@@ -106,6 +113,7 @@ declare global {
       minimizeWindow: () => Promise<void>;
       maximizeWindow: () => Promise<void>;
       closeWindow: () => Promise<void>;
+      quitApp: () => Promise<void>;
       getAppVersion: () => Promise<string>;
       isWindowMaximized: () => Promise<boolean>;
       safeReload: () => Promise<void>;
@@ -127,6 +135,29 @@ declare global {
       logs: {
         openAppLogs: () => Promise<void>;
         openServiceLogs: () => Promise<void>;
+      };
+      // Compact window
+      compact: {
+        showMain: () => Promise<void>;
+        exit: () => Promise<void>;
+      };
+      // Auth token management
+      auth: {
+        setToken: (token: string) => Promise<{ success: boolean; error?: string }>;
+        getToken: () => Promise<string | null>;
+        clearToken: () => Promise<{ success: boolean; error?: string }>;
+      };
+      // Update operations
+      update: {
+        signalReady: () => Promise<void>;
+        checkForUpdates: () => Promise<{ upToDate: boolean }>;
+        downloadUpdate: () => Promise<void>;
+        installUpdate: () => void;
+        onAvailable: (callback: (data: { message: string | null; downloadUrl: string | null; latestVersion: number }) => void) => () => void;
+        onDownloaded: (callback: () => void) => () => void;
+        onForceRequired: (callback: (data: { message: string | null; downloadUrl: string | null }) => void) => () => void;
+        onMaintenance: (callback: (data: { message: string | null }) => void) => () => void;
+        onDownloadProgress: (callback: (data: { percent: number; bytesPerSecond: number; transferred: number; total: number }) => void) => () => void;
       };
       // Platform
       platform: string;

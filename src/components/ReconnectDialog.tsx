@@ -3,11 +3,12 @@ import { RefreshCw, Clock } from 'lucide-react';
 
 interface ReconnectDialogProps {
   open: boolean;
+  message?: string;
   onReconnect: () => void;
   onDismiss: () => void;
 }
 
-const ReconnectDialog: React.FC<ReconnectDialogProps> = ({ open, onReconnect, onDismiss }) => {
+const ReconnectDialog: React.FC<ReconnectDialogProps> = ({ open, message, onReconnect, onDismiss }) => {
   if (!open) return null;
 
   return (
@@ -17,7 +18,7 @@ const ReconnectDialog: React.FC<ReconnectDialogProps> = ({ open, onReconnect, on
           Apply Changes?
         </h3>
         <p className="text-sm text-muted-foreground mb-4">
-          Split tunneling settings have changed. Reconnect now to apply, or apply on next connection.
+          {message || 'Split tunneling settings have changed. Reconnect now to apply, or apply on next connection.'}
         </p>
         <div className="flex gap-3">
           <button

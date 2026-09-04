@@ -1,12 +1,14 @@
 import React, { useState, useMemo, useCallback, useEffect } from 'react';
 import { NavLink } from 'react-router-dom';
 import { useServersWithLatency } from '@/hooks/useServers';
+import { useAnnouncements } from '@/hooks/useAnnouncements';
 import { useVPN } from '@/context/VPNContext';
 import { cn, getUSStateFlag } from '@/lib/utils';
 import { RiAccountBoxFill } from "react-icons/ri";
-import { Search, Settings, Star, ArrowUpAZ, Signal, MapPin } from 'lucide-react';
+import { Search, Settings, Star, ArrowUpAZ, Signal, MapPin, Bell } from 'lucide-react';
 import { FaServer } from "react-icons/fa";
 import { Input } from '@/components/ui/input';
+import AnnouncementsPanel from '@/components/AnnouncementsPanel';
 import {
   Accordion,
   AccordionContent,
@@ -164,12 +166,14 @@ const getAccountDisplayName = (user: User | null): string => {
 const Sidebar: React.FC = () => {
   // Data hooks
   const { data: servers = [] } = useServersWithLatency();
-  const { user, connect, connection, selectedServer, setSelectedServer } = useVPN();
+  const { user, connect, connection, selectedServer, selectServer } = useVPN();
+  const { messages: announcements, unreadCount, readIds, markRead, markUnread } = useAnnouncements();
 
   // State management
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [sortMode, setSortMode] = useState<'alphabetical' | 'ping'>('alphabetical');
   const [favoriteServerIds, setFavoriteServerIds] = useState<string[]>([]);
+  const [showAnnouncements, setShowAnnouncements] = useState(false);
 
   // Load favorites from localStorage on mount
   useEffect(() => {
@@ -187,10 +191,11 @@ const Sidebar: React.FC = () => {
     });
   }, []);
 
-  // Handle server click to select
+  // Handle server click to select — quick-switches immediately if already
+  // connected/connecting to a different server (see VPNContext.selectServer).
   const handleServerClick = useCallback((server: ServerLocation) => {
-    setSelectedServer(server);
-  }, [setSelectedServer]);
+    selectServer(server);
+  }, [selectServer]);
 
   // Process servers: build hierarchy, filter and sort
   const processedServers = useMemo(() => {
@@ -216,6 +221,20 @@ const Sidebar: React.FC = () => {
             {accountName}
           </span>
         </NavLink>
+        {announcements.length > 0 && (
+          <button
+            onClick={() => setShowAnnouncements(true)}
+            className="relative flex-shrink-0"
+            title="Announcements"
+          >
+            <Bell className="w-5 h-5 text-muted-foreground hover:text-foreground transition-colors cursor-pointer" />
+            {unreadCount > 0 && (
+              <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-1 flex items-center justify-center rounded-full bg-patriot-red text-white text-[10px] font-bold leading-none">
+                {unreadCount > 9 ? '9+' : unreadCount}
+              </span>
+            )}
+          </button>
+        )}
         <NavLink to="/settings" className="flex-shrink-0">
           <Settings className="w-6 h-6 text-muted-foreground hover:text-foreground transition-colors cursor-pointer" />
         </NavLink>
@@ -339,6 +358,15 @@ const Sidebar: React.FC = () => {
           </div>
         )}
       </nav>
+
+      <AnnouncementsPanel
+        open={showAnnouncements}
+        messages={announcements}
+        readIds={readIds}
+        onMarkRead={markRead}
+        onMarkUnread={markUnread}
+        onClose={() => setShowAnnouncements(false)}
+      />
     </aside>
   );
 };

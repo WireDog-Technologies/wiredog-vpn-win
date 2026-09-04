@@ -8,16 +8,36 @@ const { app } = require('electron');
 const log = require('electron-log');
 
 // Determine path to .env correctly for dev vs packaged app
-const envPath = app.isPackaged
-  ? path.join(process.resourcesPath, '.env') // resources/.env
-  : path.join(__dirname, '../.env');         // project root .env
+const projectRoot = path.join(__dirname, '..');
 
-// Load environment variables if .env exists
+// A packaged build's baked config lives at resourcesPath/.env — whatever
+// `npm run bake-env:production` / `bake-env:integration` copied there before
+// electron-builder ran (see package.json and electron-builder.json's extraResources).
+// An unpackaged run (`npm run dev`) always defaults to .env.development (integration)
+// instead — Vite handles the equivalent split for the renderer bundle automatically via
+// its own build-mode env file convention (see build:dev / build:integration in package.json).
+const envPath = app.isPackaged
+  ? path.join(process.resourcesPath, '.env')
+  : path.join(projectRoot, '.env.development');
+
 if (fs.existsSync(envPath)) {
-  dotenv.config({ path: envPath });
-  log.info('Loaded .env from', envPath);
+  dotenv.config({ path: envPath, override: true });
+  log.info('Loaded environment config from', envPath);
+} else if (app.isPackaged) {
+  log.warn('No baked environment config found at', envPath, '— falling back to hardcoded production defaults');
 } else {
-  log.warn('No .env file found at', envPath);
+  log.warn('No .env.development found at', envPath, '— falling back to hardcoded production defaults');
+}
+
+// Local developer override (gitignored, never shipped) — lets a dev point at a local
+// backend instead of integration without touching .env.development. Not consulted in
+// packaged builds.
+if (!app.isPackaged) {
+  const localEnvPath = path.join(projectRoot, '.env.local');
+  if (fs.existsSync(localEnvPath)) {
+    dotenv.config({ path: localEnvPath, override: true });
+    log.info('Loaded local overrides from', localEnvPath);
+  }
 }
 
 // ================================
@@ -114,6 +134,12 @@ function createMainWindow() {
   // Handle window closed
   mainWindow.on('closed', () => {
     mainWindow = null;
+  });
+
+  // Retries any /vpn/disconnect calls still owed from a previous launch/session — see
+  // VPNService.handleAppForeground / retryPendingDisconnects.
+  mainWindow.on('focus', () => {
+    vpnService.handleAppForeground();
   });
 
   // Prevent new window creation
@@ -618,6 +644,11 @@ function setupIpcHandlers() {
     }
   });
 
+  ipcMain.handle('vpn:cancel-connect', () => {
+    vpnService.cancelConnect();
+    return { success: true };
+  });
+
   ipcMain.handle('vpn:disconnect', async (_, options = {}) => {
     const disableProtection = options?.disableProtection !== false; // default true
     log.info(`VPN disconnect request (disableProtection=${disableProtection})`);
@@ -954,10 +985,19 @@ async function initializeSettingsStore() {
           apps: [],
           ips: []
         },
+        blockAdsEnabled: true,
+        blockMalwareEnabled: true,
         lastServerId: null,
         authToken: null
       }
     });
+    // Lets VPNService fetch a fresh token itself for auto-reconnect and pending-disconnect
+    // retries, which originate internally rather than from an IPC call carrying a token.
+    try {
+      vpnService.setAuthTokenProvider(() => getAuthToken());
+    } catch (err) {
+      log.warn('VPN: setAuthTokenProvider failed:', err.message);
+    }
     log.info('Settings store initialized');
   } catch (error) {
     log.error('Failed to initialize settings store:', error);
@@ -1203,9 +1243,14 @@ app.whenReady().then(async () => {
     // Don't block app startup if service fails - user can still connect manually
   }
 
+  // Retries any pending-disconnect ledger entries left over from a previous launch/crash
+  // (durable — see VPNService.cleanupOrphanedSession) before the crash-recovery check below.
+  vpnService.retryPendingDisconnects();
+
   // Crash recovery: if we have a persisted session with a sessionId but the tunnel is
-  // not active (and not in PersistentBlock), call /disconnect to decrement the backend
-  // counter left behind by the crash.
+  // not active (and not in PersistentBlock), release its counter slot via the same durable
+  // ledger cleanupOrphanedSession() uses elsewhere, so a network blip here gets retried too
+  // instead of leaking the counter outright.
   const lastSessionForCleanup = settingsStore.get('lastSession');
   if (lastSessionForCleanup?.sessionId) {
     try {
@@ -1213,15 +1258,8 @@ app.whenReady().then(async () => {
       const tunnelDown = tunnelStatus.status !== 'connected';
       const persistentBlockActive = tunnelStatus.advancedKillSwitchActive || false;
       if (tunnelDown && !persistentBlockActive) {
-        log.info('[Startup] Stale session detected — calling disconnect for counter cleanup');
-        const token = getAuthToken();
-        const headers = { 'Content-Type': 'application/json' };
-        if (token) headers['Authorization'] = `Bearer ${token}`;
-        fetch(`${vpnService.apiBaseUrl}/vpn/disconnect`, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ sessionId: lastSessionForCleanup.sessionId })
-        }).catch(err => log.warn('[Startup] Stale session cleanup failed:', err.message));
+        log.info('[Startup] Stale session detected — releasing counter slot for counter cleanup');
+        vpnService.cleanupOrphanedSession(lastSessionForCleanup.sessionId, 'crash recovery — stale session');
         settingsStore.delete('lastSession');
         vpnService.currentSession = null;
       }

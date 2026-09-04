@@ -13,7 +13,7 @@ import {
 import Logo from '@/assets/logos/wiredog-minimal-navy_1024x1024.png';
 import TextLogo from '@/assets/logos/wiredog_text_logo_1024.png';
 import { ServerLocation } from '@/types/vpn';
-import { Loader2, Shield, ShieldOff } from 'lucide-react';
+import { Loader2, Shield, ShieldOff, X } from 'lucide-react';
 
 // Type definitions
 interface HierarchyCity {
@@ -62,8 +62,8 @@ const buildHierarchy = (servers: ServerLocation[]): HierarchyState[] => {
 
 const CompactWindow: React.FC = () => {
   const { data: servers = [], isLoading } = useServers();
-  const { connection, connect, selectedServer, setSelectedServer } = useVPN();
-  const { data: geo } = useGeolocation(connection.status);
+  const { connection, connect, cancelConnect, selectedServer, setSelectedServer } = useVPN();
+  const { data: geo, isFetching: isGeoFetching } = useGeolocation(connection.status);
   const [isConnecting, setIsConnecting] = useState(false);
 
 
@@ -104,14 +104,20 @@ const CompactWindow: React.FC = () => {
       ? 'CONNECTING...'
       : 'UNPROTECTED';
 
-  // Location and IP display
-  const displayLocation = isConnected
-    ? connection.server
-      ? `${connection.server.city}, ${connection.server.stateCode}`
-      : 'Connected'
-    : geo?.city ? `${geo.city}, ${geo.region}` : 'Redacted';
+  // Covers connecting/disconnecting/reconnecting plus the brief window right after a
+  // transition where the geolocation query is still refetching.
+  const isTransitioning = isConnectingState || (!isConnected && isGeoFetching);
 
-  const displayIP = isConnected ? (connection.ipAddress || 'Redacted') : (geo?.ip || 'Redacted');
+  // Location and IP display
+  const displayLocation = isTransitioning
+    ? 'Loading...'
+    : isConnected
+      ? connection.server
+        ? `${connection.server.city}, ${connection.server.stateCode}`
+        : 'Connected'
+      : geo?.city ? `${geo.city}, ${geo.region}` : 'Redacted';
+
+  const displayIP = isTransitioning ? 'Loading...' : isConnected ? (connection.ipAddress || 'Redacted') : (geo?.ip || 'Redacted');
 
   // Handle server connect (from list)
   const handleServerConnect = async (server: ServerLocation) => {
@@ -128,7 +134,10 @@ const CompactWindow: React.FC = () => {
 
   // Handle main connection toggle button
   const handleConnect = async () => {
-    if (isConnecting) return;
+    if (isConnectingState) {
+      await cancelConnect();
+      return;
+    }
     if (isConnected) {
       try {
         await window.electronAPI?.vpn?.disconnect?.();
@@ -196,12 +205,12 @@ const CompactWindow: React.FC = () => {
       <div className="px-4 py-4 flex justify-center flex-shrink-0 border-b border-slate-700">
         <button
           onClick={handleConnect}
-          disabled={isConnectingState}
+          title={isConnectingState ? 'Cancel connecting' : undefined}
           className={cn(
-            "relative w-24 h-24 rounded-full flex items-center justify-center transition-all duration-300",
+            "relative w-24 h-24 rounded-full flex items-center justify-center transition-all duration-300 group",
             "border-4",
             isConnected && "border-connection-active bg-connection-active/10 glow-effect-green",
-            isConnectingState && "border-connection-connecting bg-connection-connecting/10 glow-effect-gold",
+            isConnectingState && "border-connection-connecting bg-connection-connecting/10 glow-effect-gold cursor-pointer",
             !isConnected && !isConnectingState && "border-accent bg-accent/10 hover:bg-accent/20"
           )}
         >
@@ -212,7 +221,10 @@ const CompactWindow: React.FC = () => {
             !isConnected && !isConnectingState && "bg-accent hover:bg-accent/90"
           )}>
             {isConnectingState ? (
-              <Loader2 className="w-6 h-6 text-background animate-spin" />
+              <>
+                <Loader2 className="w-6 h-6 text-background animate-spin group-hover:hidden" />
+                <X className="w-6 h-6 text-background hidden group-hover:block" />
+              </>
             ) : isConnected ? (
               <Shield className="w-6 h-6 text-background" />
             ) : (

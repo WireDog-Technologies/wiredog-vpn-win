@@ -94,6 +94,7 @@ interface BottomToolbarProps {
   connectedServer: ServerLocation | null;
   isSubscriptionActive: boolean;
   onConnect: () => void;
+  onCancelConnect: () => void;
   onDisconnect: () => void;
   speedData: {
     downloadSpeed: number;
@@ -110,6 +111,7 @@ const BottomToolbar: React.FC<BottomToolbarProps> = ({
   connectedServer,
   isSubscriptionActive,
   onConnect,
+  onCancelConnect,
   onDisconnect,
   speedData
 }) => {
@@ -142,7 +144,15 @@ const BottomToolbar: React.FC<BottomToolbarProps> = ({
             <p className="text-[11px] text-muted-foreground leading-tight">{displayServer.state ?? 'Unknown'}</p>
           </div>
           {isConnecting ? (
-            <Loader2 className="w-4 h-4 animate-spin text-connection-connecting flex-shrink-0" />
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onCancelConnect}
+              className="flex-shrink-0 text-xs font-semibold tracking-wide gap-1.5"
+            >
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-connection-connecting" />
+              Cancel
+            </Button>
           ) : !isSubscriptionActive && !isConnected ? (
             <Button
               variant="outline"

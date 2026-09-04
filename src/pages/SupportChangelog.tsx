@@ -1,14 +1,33 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { ChevronLeft } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
+import { useElectron } from '@/context/ElectronContext';
 
 const SupportChangelog: React.FC = () => {
   const navigate = useNavigate();
-  const appVersion = '1.0.0';
+  const { getAppVersion } = useElectron();
+  const [appVersion, setAppVersion] = useState('1.1.0');
+
+  useEffect(() => {
+    getAppVersion().then(setAppVersion).catch(() => {});
+  }, [getAppVersion]);
 
   const changelog = [
+    {
+      version: '1.1.0',
+      date: 'September 2026',
+      changes: [
+        'Guardian Mode: independently toggle ad blocking and malware blocking, applied at the DNS level',
+        'In-app announcements: a bell icon now surfaces service updates and maintenance notices',
+        'Quick server switching: select a new server while connected and it switches over automatically',
+        'You can now cancel a connection attempt: a Cancel button appears while connecting',
+        'Clearer error when you’ve hit your 5-device connection limit',
+        'Location and IP now show "Loading..." during connect/disconnect instead of briefly showing stale info',
+        'Sessions now stay signed in significantly longer',
+      ],
+    },
     {
       version: '1.0.0',
       date: 'May 2026',

@@ -1,0 +1,10 @@
+{
+  "extends": "./electron-builder.json",
+  "artifactName": "WireDog-VPN-DryRun-${version}-${arch}.${ext}",
+  "win": {
+    "sign": "./build/dryRunSign.js"
+  },
+  "nsis": {
+    "artifactName": "WireDog-VPN-DryRun-${version}-${arch}.${ext}"
+  }
+}
