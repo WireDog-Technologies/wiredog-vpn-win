@@ -44,6 +44,8 @@
         "arch": ["x64", "arm64"]
       }
     ],
+    "sign": "./customSign.js",
+    "signDlls": true,
     "verifyUpdateCodeSignature": false
   },
   "nsis": {
