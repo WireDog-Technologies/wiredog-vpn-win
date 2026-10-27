@@ -8,13 +8,24 @@ import { useElectron } from '@/context/ElectronContext';
 const SupportChangelog: React.FC = () => {
   const navigate = useNavigate();
   const { getAppVersion } = useElectron();
-  const [appVersion, setAppVersion] = useState('1.1.0');
+  const [appVersion, setAppVersion] = useState('1.2.0');
 
   useEffect(() => {
     getAppVersion().then(setAppVersion).catch(() => {});
   }, [getAppVersion]);
 
   const changelog = [
+    {
+      version: '1.2.0',
+      date: 'October 2026',
+      changes: [
+        'WireDog Business support: SSO sign-in, two-factor authentication, and organization Dedicated IPs.',
+        'Forgot password: reset your password from the sign-in screen.',
+        'Manage Account now opens your account dashboard already signed in.',
+        'Fixed server latency appearing higher than it really is while connected.',
+        'Fixed connections that could use up an extra device slot, and reconnecting now waits between attempts.',
+      ],
+    },
     {
       version: '1.1.0',
       date: 'September 2026',

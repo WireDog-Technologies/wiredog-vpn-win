@@ -48,7 +48,7 @@ const RecommendedServers: React.FC = () => {
                   {server.stateCode}
                 </div>
                 <div>
-                  <p className="text-sm font-medium">{server.city}</p>
+                  <p className="text-sm font-medium">{server.gatewayName ?? server.city}</p>
                   <p className="text-xs text-muted-foreground">{server.state}</p>
                 </div>
               </div>

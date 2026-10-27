@@ -170,12 +170,18 @@ const USMap: React.FC = () => {
   // back to an idle/connectable state.
   const isConnecting = connection.status === 'connecting' || isSwitchingServer;
 
-  // Set default server on mount (first recommended server)
+  // Set default server on mount (first recommended server). Also re-pick when the current
+  // selection is no longer offered (e.g. the account just changed and the new list is restricted
+  // to the organization's own servers). Never while connected/connecting: that selection is live.
   useEffect(() => {
-    if (recommendedServers.length > 0 && !selectedServer) {
-      setSelectedServer(recommendedServers[0]);
+    const fallback = recommendedServers[0] ?? servers[0];
+    if (!fallback) return;
+    if (!selectedServer) {
+      setSelectedServer(fallback);
+    } else if (connection.status === 'disconnected' && !servers.some(s => s.id === selectedServer.id)) {
+      setSelectedServer(fallback);
     }
-  }, [recommendedServers, selectedServer]);
+  }, [recommendedServers, servers, selectedServer, connection.status]);
 
   // Speed monitoring effect
   useEffect(() => {

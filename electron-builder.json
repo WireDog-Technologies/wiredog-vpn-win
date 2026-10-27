@@ -1,6 +1,12 @@
 {
   "appId": "com.wiredog.vpn",
   "productName": "WireDog VPN",
+  "protocols": [
+    {
+      "name": "WireDog SSO",
+      "schemes": ["wiredog"]
+    }
+  ],
   "directories": {
     "output": "release"
   },

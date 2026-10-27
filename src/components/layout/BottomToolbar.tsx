@@ -1,7 +1,7 @@
 import React from 'react';
 import { Loader2, ArrowDown, ArrowUp, Server, Activity, Signal } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { ServerLocation } from '@/types/vpn';
+import { ServerLocation, isDedicatedServer } from '@/types/vpn';
 import { getUSStateFlag } from '@/lib/utils';
 
 // Parse WireGuard byte strings like "1.5 MiB" to bytes
@@ -200,7 +200,7 @@ const BottomToolbar: React.FC<BottomToolbarProps> = ({
                 {(displayServer.latency ?? 0) > 0 ? `${displayServer.latency}ms` : '—'}<Signal className="w-2.5 h-2.5" />
               </span>
             </div>
-            <span className="flex items-center gap-1 text-muted-foreground/40">{displayServer.id?.toUpperCase() ?? '---'}<Server className="w-2.5 h-2.5" /></span>
+            <span className="flex items-center gap-1 text-muted-foreground/40"><span className="max-w-[180px] truncate">{isDedicatedServer(displayServer) ? (displayServer.gatewayName ?? 'DEDICATED') : (displayServer.id?.toUpperCase() ?? '---')}</span><Server className="w-2.5 h-2.5" /></span>
           </div>
         </div>
       </div>

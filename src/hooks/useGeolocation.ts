@@ -1,4 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
+import { useVPN } from '@/context/VPNContext';
 
 interface GeoLocation {
   ip: string;
@@ -8,6 +9,7 @@ interface GeoLocation {
 }
 
 export function useGeolocation(connectionStatus?: string) {
+  const { isStatusResolved } = useVPN();
   return useQuery({
     queryKey: ['geolocation', connectionStatus],
     queryFn: async (): Promise<GeoLocation> => {
@@ -40,7 +42,11 @@ export function useGeolocation(connectionStatus?: string) {
         };
       }
     },
-    enabled: connectionStatus !== 'connected',
+    // Only look up the real IP/location while genuinely disconnected. When connected, the exit IP
+    // comes from the backend's /vpn/connect response instead of a lookup through the tunnel, and
+    // until the first tunnel-status read lands the app may have been relaunched with the tunnel
+    // already up, so a lookup then would hand the exit IP to a third party.
+    enabled: isStatusResolved && connectionStatus === 'disconnected',
     staleTime: 5 * 60 * 1000,
     retry: false,
   });

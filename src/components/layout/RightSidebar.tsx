@@ -134,7 +134,7 @@ const RightSidebar: React.FC = () => {
                 : isError
                 ? `${connection.server?.city || '—'}, ${connection.server?.stateCode || '—'}`
                 : isConnected
-                ? `${connection.server?.city}, ${connection.server?.stateCode}`
+                ? (connection.server?.gatewayName ?? `${connection.server?.city}, ${connection.server?.stateCode}`)
                 : (geo?.city ? `${geo.city}, ${geo.region}` : 'Redacted')}
             </p>
           </div>
@@ -146,7 +146,7 @@ const RightSidebar: React.FC = () => {
               "text-sm font-iosevka font-semibold",
               isError ? "text-red-500" : isConnected ? "text-connection-active" : "text-accent"
             )}>
-              {isTransitioning ? 'Loading...' : isError ? '—' : isConnected ? (connection.ipAddress || 'Redacted') : (geo?.ip || 'Redacted')}
+              {isTransitioning ? 'Loading...' : isError ? '—' : isConnected ? (connection.ipAddress || 'Unknown') : (geo?.ip || 'Redacted')}
             </p>
           </div>
         </div>

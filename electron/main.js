@@ -46,6 +46,7 @@ if (!app.isPackaged) {
 const { BrowserWindow, ipcMain, Menu, Tray, shell, dialog, safeStorage } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const vpnService = require('./vpn');
+const sso = require('./sso');
 
 // Configure logging
 log.transports.file.level = 'info';
@@ -75,6 +76,30 @@ const isMac = process.platform === 'darwin';
 
 // Track whether app is quitting to distinguish from minimize-to-tray
 let isQuitting = false;
+
+// Enforce single instance. Besides avoiding two copies of the tunnel manager, this is what lets the
+// wiredog://sso callback reach the running app: the OS launches the registered handler as a second
+// instance, whose command line is forwarded to the first (see 'second-instance' below).
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  app.quit();
+}
+
+// Register wiredog:// so the browser can hand the SSO callback (wiredog://sso?code=...) back to
+// the app. In a packaged build the installer's protocol entry (see electron-builder.json) does the
+// real work; this covers unpackaged/dev runs where possible.
+try {
+  if (process.defaultApp && process.argv.length >= 2) {
+    app.setAsDefaultProtocolClient(sso.CALLBACK_SCHEME, process.execPath, [path.resolve(process.argv[1])]);
+  } else {
+    app.setAsDefaultProtocolClient(sso.CALLBACK_SCHEME);
+  }
+} catch (error) {
+  log.warn('Could not register the wiredog:// protocol handler:', error.message);
+}
+
+// Cold start: the OS launched us to deliver a callback. Hold it until the window exists.
+let launchCallbackUrl = sso.findCallbackUrl(process.argv);
 
 /**
  * Create the main application window
@@ -578,6 +603,23 @@ function setupIpcHandlers() {
     return mainWindow ? mainWindow.isMaximized() : false;
   });
 
+  // Business SSO: browser sign-in, resolved by the wiredog://sso callback
+  ipcMain.handle('sso:authenticate', async (_, domain) => {
+    if (typeof domain !== 'string' || !/^[a-z0-9.-]+$/i.test(domain)) {
+      throw new Error('SSO_FAILED');
+    }
+    return sso.authenticate(getApiBaseUrl(), domain.toLowerCase());
+  });
+
+  ipcMain.handle('sso:cancel', () => {
+    sso.cancel();
+  });
+
+  // Published Privacy Policy / Terms of Service versions. null when unavailable (fail open).
+  ipcMain.handle('legal:get-config', async () => {
+    return fetchLegalVersions();
+  });
+
   // System operations
   ipcMain.handle('system:open-external', async (event, url) => {
     try {
@@ -596,8 +638,8 @@ function setupIpcHandlers() {
   });
 
   // VPN operations - Real implementation
-  ipcMain.handle('vpn:connect', async (event, { serverId, settings }) => {
-    log.info(`VPN connect request: ${serverId}`);
+  ipcMain.handle('vpn:connect', async (event, { serverId, settings, gatewayId }) => {
+    log.info(`VPN connect request: ${serverId}${gatewayId ? ` (gateway ${gatewayId})` : ''}`);
 
     // Re-check update policy before allowing connection
     log.info('[Update] Pre-connect policy check before VPN connection');
@@ -629,10 +671,16 @@ function setupIpcHandlers() {
 
     try {
       const token = getAuthToken();
-      const result = await vpnService.connect(serverId, settings, token);
+      const result = await vpnService.connect(serverId, settings, token, gatewayId ?? null);
 
-      // Save last connected server for auto-connect feature
+      // Save last connected server for auto-connect feature. The gateway (an organization's
+      // named Dedicated IP) is stored next to it so auto-connect goes back through the same one.
       settingsStore.set('lastServerId', serverId);
+      if (gatewayId) {
+        settingsStore.set('lastGatewayId', gatewayId);
+      } else {
+        settingsStore.delete('lastGatewayId');
+      }
 
       // Persist session for app restart recovery
       settingsStore.set('lastSession', result);
@@ -866,6 +914,8 @@ function setupIpcHandlers() {
       }).on('error', reject);
     });
 
+    // Event only, never the IP: makes any third-party IP lookup visible in the app log.
+    log.info('[IPService] third-party geolocation lookup');
     try {
       // ip-api.com returns IP + location in one call (no API key needed, 45 req/min)
       const data = await get('http://ip-api.com/json/?fields=query,city,region,regionName,country');
@@ -909,6 +959,11 @@ function setupIpcHandlers() {
   // Latency measurement
   ipcMain.handle('latency:measure-servers', async (_, servers) => {
     try {
+      // Probes made with the tunnel up (or coming up) are routed through the connected server,
+      // which inflates every server's latency. Only measure while genuinely disconnected.
+      if (!(await vpnService.isIdleForLatency())) {
+        return {};
+      }
       const latency = require('./latency');
       return await latency.measureAll(servers);
     } catch (error) {
@@ -998,6 +1053,12 @@ async function initializeSettingsStore() {
     } catch (err) {
       log.warn('VPN: setAuthTokenProvider failed:', err.message);
     }
+    // Lets VPNService read the last session main.js persisted, as a fallback when releasing a slot.
+    try {
+      vpnService.setConfigStore(settingsStore);
+    } catch (err) {
+      log.warn('VPN: setConfigStore failed:', err.message);
+    }
     log.info('Settings store initialized');
   } catch (error) {
     log.error('Failed to initialize settings store:', error);
@@ -1044,6 +1105,27 @@ async function checkUpdatePolicy() {
     return policy;
   } catch (error) {
     log.error(`[Update] Failed to fetch update policy: ${error.message}`);
+    return null;
+  }
+}
+
+async function fetchLegalVersions() {
+  try {
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Legal config timeout')), 10000)
+    );
+    const config = await Promise.race([fetchJson(`${getApiBaseUrl()}/app/config`), timeoutPromise]);
+    const legal = config.legal;
+    if (legal && typeof legal.privacyVersion === 'string' && typeof legal.termsVersion === 'string') {
+      return {
+        privacyVersion: legal.privacyVersion,
+        termsVersion: legal.termsVersion,
+        summary: typeof legal.summary === 'string' ? legal.summary : null,
+      };
+    }
+    return null;
+  } catch (error) {
+    log.warn(`[Legal] Could not fetch legal versions: ${error.message}`);
     return null;
   }
 }
@@ -1233,6 +1315,22 @@ app.whenReady().then(async () => {
   createTray();
   createMenu();
 
+  if (launchCallbackUrl) {
+    // Nothing is waiting for it after a cold start (a sign-in always starts inside the running
+    // app), so this is dropped by handleCallbackUrl; kept so a stray link is logged, not lost silently.
+    sso.handleCallbackUrl(launchCallbackUrl);
+    launchCallbackUrl = null;
+  }
+
+  // Release anything a previous run owes the backend. Pure HTTP, so it must not depend on the
+  // VPN service being reachable: a launch where the service had to be (re)started or failed to
+  // start is exactly when a previous session is most likely to be left behind.
+  try {
+    vpnService.retryPendingDisconnects();
+  } catch (error) {
+    log.warn('VPN: pending-disconnect retry at launch failed:', error.message);
+  }
+
   // Ensure Windows Service is running (attempt to start if not available)
   try {
     log.info('Attempting to ensure VPN Service is running...');
@@ -1242,10 +1340,6 @@ app.whenReady().then(async () => {
     log.warn('VPN Service startup:', error.message);
     // Don't block app startup if service fails - user can still connect manually
   }
-
-  // Retries any pending-disconnect ledger entries left over from a previous launch/crash
-  // (durable — see VPNService.cleanupOrphanedSession) before the crash-recovery check below.
-  vpnService.retryPendingDisconnects();
 
   // Crash recovery: if we have a persisted session with a sessionId but the tunnel is
   // not active (and not in PersistentBlock), release its counter slot via the same durable
@@ -1259,7 +1353,7 @@ app.whenReady().then(async () => {
       const persistentBlockActive = tunnelStatus.advancedKillSwitchActive || false;
       if (tunnelDown && !persistentBlockActive) {
         log.info('[Startup] Stale session detected — releasing counter slot for counter cleanup');
-        vpnService.cleanupOrphanedSession(lastSessionForCleanup.sessionId, 'crash recovery — stale session');
+        vpnService.cleanupOrphanedSession(lastSessionForCleanup.sessionId, 'crash recovery — stale session', { immediate: true });
         settingsStore.delete('lastSession');
         vpnService.currentSession = null;
       }
@@ -1310,18 +1404,32 @@ app.on('window-all-closed', () => {
   }
 });
 
-app.on('before-quit', async () => {
+// Electron does not wait for an async before-quit handler, so the quit is held until the VPN
+// cleanup (tunnel down, backend slot released) has finished, bounded so a dead network can't
+// keep the app from closing. Anything that doesn't complete is retried from the
+// pending-disconnect ledger at the next launch.
+let quitCleanupDone = false;
+app.on('before-quit', (event) => {
   isQuitting = true;
+  if (quitCleanupDone) return;
+  event.preventDefault();
+  quitCleanupDone = true;
   log.info('Application quitting - cleaning up VPN');
-  try {
-    await vpnService.cleanup();
-  } catch (error) {
-    log.error('VPN cleanup failed:', error);
-  }
+  Promise.race([
+    vpnService.cleanup(),
+    new Promise((resolve) => setTimeout(resolve, 5000)),
+  ])
+    .catch((error) => log.error('VPN cleanup failed:', error))
+    .finally(() => app.quit());
 });
 
-// Handle app being opened from system tray
-app.on('second-instance', () => {
+// When a second instance is launched, show and focus the existing window
+app.on('second-instance', (event, commandLine) => {
+  // On Windows a wiredog:// link opened in the browser arrives as a second launch whose
+  // command line carries the URL.
+  const callbackUrl = sso.findCallbackUrl(commandLine);
+  if (callbackUrl) sso.handleCallbackUrl(callbackUrl);
+
   if (mainWindow) {
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.focus();
