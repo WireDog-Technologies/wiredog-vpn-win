@@ -43,9 +43,10 @@ if (!app.isPackaged) {
 // ================================
 // Import Electron and other modules
 // ================================
-const { BrowserWindow, ipcMain, Menu, Tray, shell, dialog, safeStorage } = require('electron');
+const { BrowserWindow, ipcMain, Menu, Tray, shell, dialog, safeStorage, powerMonitor } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const vpnService = require('./vpn');
+const apiRelay = require('./apiRelay');
 const sso = require('./sso');
 
 // Configure logging
@@ -957,6 +958,10 @@ function setupIpcHandlers() {
   });
 
   // Latency measurement
+  // The renderer's fetch() cannot reach the Rescue Relay, so it asks the main process to make that one
+  // request. Only the configured API host is ever contacted (see apiRelay.relayForRenderer).
+  ipcMain.handle('api:relay-request', async (_event, request) => apiRelay.relayForRenderer(request || {}));
+
   ipcMain.handle('latency:measure-servers', async (_, servers) => {
     try {
       // Probes made with the tunnel up (or coming up) are routed through the connected server,
@@ -1059,6 +1064,17 @@ async function initializeSettingsStore() {
     } catch (err) {
       log.warn('VPN: setConfigStore failed:', err.message);
     }
+    // Rescue Relay: addresses the backend publishes for clients whose kill switch blocks the network.
+    // Loaded from the store and handed to the service so the block keeps them reachable.
+    try {
+      apiRelay.init({
+        store: settingsStore,
+        push: (ips) => require('./ipc/service-client').setApiRelays(ips),
+        apiBaseUrl: getApiBaseUrl(),
+      });
+    } catch (err) {
+      log.warn('Relay: init failed:', err.message);
+    }
     log.info('Settings store initialized');
   } catch (error) {
     log.error('Failed to initialize settings store:', error);
@@ -1070,26 +1086,18 @@ async function initializeSettingsStore() {
  * App update system
  * Checks backend policy, then uses electron-updater for download/install.
  */
-const https = require('https');
-const http = require('http');
-
 function getApiBaseUrl() {
   return process.env.VITE_API_URL
     || (isDev ? 'http://localhost:3001/api' : 'https://api.wiredogvpn.com/api');
 }
 
-function fetchJson(url) {
-  return new Promise((resolve, reject) => {
-    const client = url.startsWith('https') ? https : http;
-    client.get(url, (res) => {
-      let data = '';
-      res.on('data', (chunk) => data += chunk);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch { reject(new Error('Invalid JSON')); }
-      });
-    }).on('error', reject);
-  });
+// Goes through apiRelay.apiFetch so the update/legal/relay-list check still works while a kill switch
+// is blocking the network (it falls back to the Rescue Relay). The 10 s cap keeps a blocked network
+// from stalling a connect that waits on the update policy.
+async function fetchJson(url) {
+  const response = await apiRelay.apiFetch(url, { signal: AbortSignal.timeout(10000) });
+  try { return await response.json(); }
+  catch { throw new Error('Invalid JSON'); }
 }
 
 async function checkUpdatePolicy() {
@@ -1097,6 +1105,8 @@ async function checkUpdatePolicy() {
   const platformKey = process.arch === 'arm64' ? 'windows-arm64' : 'windows-x64';
   try {
     const config = await fetchJson(url);
+    // Absent (older backend) leaves the saved list alone; an empty list switches the relay off.
+    if (Array.isArray(config.apiRelays)) apiRelay.setRelays(config.apiRelays);
     const policy = config.platforms?.[platformKey];
     if (!policy) {
       log.info(`[Update] No ${platformKey} platform policy found in response`);
@@ -1300,6 +1310,11 @@ function setupUpdateSystem() {
 
 // App event handlers
 app.whenReady().then(async () => {
+  // Sleep/wake (lid close, hibernate): record it, so a tunnel that is dead after a wake-up can be
+  // read against the sleep that caused it. Recovery itself is the service's job (see VPNService).
+  powerMonitor.on('suspend', () => vpnService.handleSuspend());
+  powerMonitor.on('resume', () => vpnService.handleResume());
+
   log.info('Electron app ready');
   await initializeSettingsStore();
   setupIpcHandlers();

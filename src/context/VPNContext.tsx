@@ -127,6 +127,12 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [isStatusResolved, setIsStatusResolved] = useState(false);
   const [advancedKillSwitchActive, setAdvancedKillSwitchActive] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
+
+  // While a kill switch is holding the network blocked (no tunnel), backend requests go through the
+  // Rescue Relay first instead of waiting out a direct attempt that cannot succeed.
+  useEffect(() => {
+    api.setApiBlockHint(connection.status !== 'connected' && (connection.status === 'error' || advancedKillSwitchActive));
+  }, [connection.status, advancedKillSwitchActive]);
   const clearConnectionError = useCallback(() => setConnectionError(null), []);
 
   // Load settings from electron-store on mount
@@ -411,6 +417,12 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       // Note: Do NOT sync killSwitchEnabled from backend — that reflects runtime WFP filter state,
       // not the user's preference. The setting persists in electron-store and is sent on connect.
       const applyStatus = (status: any) => {
+        // The login expired while the app was away and its reconnect could not continue: go back to
+        // sign-in with the usual message instead of leaving a dead tunnel on screen.
+        if (status.authExpired) {
+          handleUnauthorized();
+          return;
+        }
         if (status.advancedKillSwitchActive !== undefined) {
           setAdvancedKillSwitchActive(status.advancedKillSwitchActive);
         }

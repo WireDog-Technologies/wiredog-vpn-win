@@ -1976,12 +1976,13 @@ public class WfpEngine : IDisposable
     /// These filters survive process exit AND system reboot (FWPM_FILTER_FLAG_PERSISTENT).
     /// Must call OpenPersistentSession() first.
     /// </summary>
-    public void AddPersistentBlockAllFilters()
+    public void AddPersistentBlockAllFilters(IEnumerable<string>? relayIps = null)
     {
         if (!_isPersistentOpen)
             throw new InvalidOperationException("Persistent WFP session not open");
 
         _logger.LogInformation("[Persistent KS] Adding persistent block-all filters...");
+        _persistentRelayIps.Clear();
 
         // --- Block all IPv4 (weight 10 - lowest, overridden by all dynamic permits) ---
         AddPersistentFilterInternal("Persistent Block All IPv4 (Transport)",
@@ -2004,7 +2005,91 @@ public class WfpEngine : IDisposable
         // --- Permit LAN subnets (weight 180) ---
         AddPersistentLanFilters();
 
+        // --- Permit the Rescue Relay (TCP 443 to its address only, weight 185) ---
+        if (relayIps != null) AddPersistentRelayFilters(relayIps);
+
         _logger.LogInformation("[Persistent KS] Persistent block-all filters added ({Count} total)", _persistentFilterIds.Count);
+    }
+
+    // Relay addresses that already have a persistent permit, so a refresh only adds the new ones.
+    private readonly HashSet<string> _persistentRelayIps = new();
+
+    /// <summary>
+    /// Persistent permit (outbound TCP 443) for each relay address not already permitted. Additive: an
+    /// address that was retired keeps its permit until the persistent block is next rebuilt, so a list
+    /// refresh never opens a gap in the block.
+    /// </summary>
+    public void AddPersistentRelayFilters(IEnumerable<string> relayIps)
+    {
+        if (!_isPersistentOpen)
+            throw new InvalidOperationException("Persistent WFP session not open");
+
+        foreach (var relayIp in relayIps)
+        {
+            if (_persistentRelayIps.Contains(relayIp)) continue;
+            if (!IPAddress.TryParse(relayIp, out var ip) || ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+            {
+                _logger.LogWarning("[Persistent KS] Ignoring invalid relay address {Ip}", relayIp);
+                continue;
+            }
+
+            byte[] b = ip.GetAddressBytes();
+            uint ipUint = ((uint)b[0] << 24) | ((uint)b[1] << 16) | ((uint)b[2] << 8) | b[3];
+
+            var addrCondition = new FWPM_FILTER_CONDITION0
+            {
+                fieldKey = WfpGuids.FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                matchType = WfpConstants.FWP_MATCH_EQUAL,
+                conditionValue = new FWP_CONDITION_VALUE0
+                {
+                    type = WfpConstants.FWP_UINT32,
+                    value = new FWP_VALUE0_UNION { uint32 = ipUint }
+                }
+            };
+            var protoCondition = new FWPM_FILTER_CONDITION0
+            {
+                fieldKey = WfpGuids.FWPM_CONDITION_IP_PROTOCOL,
+                matchType = WfpConstants.FWP_MATCH_EQUAL,
+                conditionValue = new FWP_CONDITION_VALUE0
+                {
+                    type = WfpConstants.FWP_UINT8,
+                    value = new FWP_VALUE0_UNION { uint8 = WfpConstants.IPPROTO_TCP }
+                }
+            };
+            var portCondition = new FWPM_FILTER_CONDITION0
+            {
+                fieldKey = WfpGuids.FWPM_CONDITION_IP_REMOTE_PORT,
+                matchType = WfpConstants.FWP_MATCH_EQUAL,
+                conditionValue = new FWP_CONDITION_VALUE0
+                {
+                    type = WfpConstants.FWP_UINT16,
+                    value = new FWP_VALUE0_UNION { uint16 = 443 }
+                }
+            };
+
+            int size = Marshal.SizeOf<FWPM_FILTER_CONDITION0>();
+            IntPtr transportPtr = Marshal.AllocHGlobal(size * 3);
+            IntPtr packetPtr = Marshal.AllocHGlobal(size);
+            try
+            {
+                Marshal.StructureToPtr(addrCondition, transportPtr, false);
+                Marshal.StructureToPtr(protoCondition, IntPtr.Add(transportPtr, size), false);
+                Marshal.StructureToPtr(portCondition, IntPtr.Add(transportPtr, 2 * size), false);
+                Marshal.StructureToPtr(addrCondition, packetPtr, false);
+
+                // Transport layer can match protocol and port; the IP packet layer can only match the address.
+                AddPersistentFilterInternal($"Persistent Permit Relay {relayIp} (Transport)",
+                    WfpGuids.FWPM_LAYER_OUTBOUND_TRANSPORT_V4, WfpConstants.FWP_ACTION_PERMIT, transportPtr, 3, 185);
+                AddPersistentFilterInternal($"Persistent Permit Relay {relayIp} (IPPacket)",
+                    WfpGuids.FWPM_LAYER_OUTBOUND_IPPACKET_V4, WfpConstants.FWP_ACTION_PERMIT, packetPtr, 1, 185);
+                _persistentRelayIps.Add(relayIp);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(transportPtr);
+                Marshal.FreeHGlobal(packetPtr);
+            }
+        }
     }
 
     /// <summary>

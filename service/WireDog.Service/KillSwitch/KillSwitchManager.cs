@@ -536,7 +536,7 @@ public class KillSwitchManager : IDisposable
             try
             {
                 _wfpEngine.OpenPersistentSession();
-                _wfpEngine.AddPersistentBlockAllFilters();
+                _wfpEngine.AddPersistentBlockAllFilters(_advancedConfig.ApiRelayIps);
 
                 _persistentBlockActive = true;
                 TransitionState(KillSwitchState.ConnectedPersistent, "EnablePersistentBlock");
@@ -581,7 +581,7 @@ public class KillSwitchManager : IDisposable
             try
             {
                 _wfpEngine.OpenPersistentSession();
-                _wfpEngine.AddPersistentBlockAllFilters();
+                _wfpEngine.AddPersistentBlockAllFilters(_advancedConfig.ApiRelayIps);
                 _logger.LogInformation("[AdvKS] Persistent block-all filters created");
             }
             catch (Exception ex)
@@ -679,6 +679,68 @@ public class KillSwitchManager : IDisposable
     }
 
     /// <summary>
+    /// Set the Rescue Relay addresses the block must keep reachable (TCP 443 only). Only public IPv4
+    /// addresses are accepted, at most four: a bad list must not be able to open a wider hole.
+    /// Takes effect at the next block, and immediately in a block that is already up. A retired
+    /// address keeps its permit in an existing persistent block until that block is next rebuilt.
+    /// </summary>
+    public void SetApiRelays(IEnumerable<string> ips)
+    {
+        var valid = new List<string>();
+        foreach (var raw in ips ?? Array.Empty<string>())
+        {
+            var candidate = raw?.Trim() ?? "";
+            if (IsPublicIpv4(candidate) && !valid.Contains(candidate)) valid.Add(candidate);
+            if (valid.Count >= 4) break;
+        }
+
+        lock (_lock)
+        {
+            if (valid.SequenceEqual(_advancedConfig.ApiRelayIps)) return;
+
+            var added = valid.Where(ip => !_advancedConfig.ApiRelayIps.Contains(ip)).ToList();
+            _advancedConfig.ApiRelayIps = valid;
+            _advancedConfig.Save();
+            _logger.LogInformation("[Relay] API relay addresses set: {Count} ({Added} new)", valid.Count, added.Count);
+
+            // A block that is up now should honor the new addresses without waiting for the next one.
+            try
+            {
+                if (_state == KillSwitchState.Bootstrap)
+                {
+                    foreach (var relayIp in added)
+                    {
+                        _activeFilters.Add(_wfpEngine.AddPermitVpnServerFilter($"Permit API Relay {relayIp}", relayIp, 443, true, 185));
+                        _activeFilters.Add(_wfpEngine.AddPermitVpnServerInboundFilter($"Permit API Relay Inbound {relayIp}", relayIp, 443, true, 185));
+                    }
+                }
+                if (_persistentBlockActive && added.Count > 0)
+                {
+                    _wfpEngine.OpenPersistentSession();
+                    _wfpEngine.AddPersistentRelayFilters(added);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[Relay] Could not apply the new relay addresses to the active block");
+            }
+        }
+    }
+
+    private static bool IsPublicIpv4(string value)
+    {
+        if (!System.Net.IPAddress.TryParse(value, out var ip) || ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+            return false;
+        var b = ip.GetAddressBytes();
+        if (b[0] == 0 || b[0] == 10 || b[0] == 127 || b[0] >= 224) return false;      // this-net, private, loopback, multicast/reserved
+        if (b[0] == 100 && b[1] >= 64 && b[1] <= 127) return false;                    // carrier-grade NAT
+        if (b[0] == 169 && b[1] == 254) return false;                                  // link-local
+        if (b[0] == 172 && b[1] >= 16 && b[1] <= 31) return false;                     // private
+        if (b[0] == 192 && b[1] == 168) return false;                                  // private
+        return true;
+    }
+
+    /// <summary>
     /// Recover persistent kill switch state on service startup.
     /// Call this after WfpEngine.Open() during service initialization.
     /// </summary>
@@ -704,7 +766,7 @@ public class KillSwitchManager : IDisposable
                     try
                     {
                         _wfpEngine.OpenPersistentSession();
-                        _wfpEngine.AddPersistentBlockAllFilters();
+                        _wfpEngine.AddPersistentBlockAllFilters(_advancedConfig.ApiRelayIps);
                     }
                     catch (Exception ex)
                     {
@@ -790,6 +852,21 @@ public class KillSwitchManager : IDisposable
             {
                 _logger.LogError(ex, "Failed to add VPN server permit — cannot safely bootstrap");
                 throw;
+            }
+        }
+
+        // 2b. Rescue Relay: TCP 443 to its address only, so the app can still reach the backend
+        foreach (var relayIp in _advancedConfig.ApiRelayIps)
+        {
+            try
+            {
+                _activeFilters.Add(_wfpEngine.AddPermitVpnServerFilter($"Permit API Relay {relayIp}", relayIp, 443, true, 185));
+                _activeFilters.Add(_wfpEngine.AddPermitVpnServerInboundFilter($"Permit API Relay Inbound {relayIp}", relayIp, 443, true, 185));
+            }
+            catch (Exception ex)
+            {
+                // The relay is a convenience; failing to permit it must never stop the block itself.
+                _logger.LogWarning(ex, "Failed to add API relay permit for {Ip}", relayIp);
             }
         }
 

@@ -33,6 +33,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // System operations
   openExternal: (url) => ipcRenderer.invoke('system:open-external', url),
 
+  // Rescue Relay: one backend request made by the main process when the renderer's own fetch cannot
+  // reach the backend (a kill switch is blocking). Resolves { ok: false } when no relay answers.
+  relayRequest: (request) => ipcRenderer.invoke('api:relay-request', request),
+
   // Latency measurement
   measureLatency: (servers) => ipcRenderer.invoke('latency:measure-servers', servers),
 

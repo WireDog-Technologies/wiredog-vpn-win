@@ -81,8 +81,9 @@ const RightSidebar: React.FC = () => {
       return;
     }
     if (isError) {
-      // Connection lost — disconnect to clean up, then user can reconnect
-      await disconnect();
+      // Connection lost — disconnect to clean up, then user can reconnect. With Always-on the block
+      // stays; only turning Always-on off (link below the status) restores the internet.
+      await disconnect({ disableProtection: !settings.permanentKillSwitch });
       return;
     }
     if (isConnected) {
@@ -202,6 +203,39 @@ const RightSidebar: React.FC = () => {
         )}>
           {isError ? "CONNECTION LOST" : isConnected ? "PROTECTED" : isConnecting ? "CONNECTING..." : advancedKillSwitchActive ? "PROTECTED (NO VPN)" : !isSubscriptionActive ? <>NO ACTIVE<br />SUBSCRIPTION</> : "UNPROTECTED"}
         </p>
+
+        {/* Why the internet is blocked, and the way out. Shown only while a kill switch is holding the block. */}
+        {isError && settings.killSwitch && !settings.permanentKillSwitch && (
+          <p className="text-center text-xs text-muted-foreground mb-2">
+            Can't reconnect. Your internet is paused to protect you. Click the button to disconnect and restore it.
+          </p>
+        )}
+        {isError && settings.permanentKillSwitch && (
+          <div className="text-center mb-2">
+            <p className="text-xs text-muted-foreground">
+              Can't reconnect. Always-on is keeping your internet blocked to protect you.
+            </p>
+            <button
+              onClick={() => updateSettings({ permanentKillSwitch: false })}
+              className="text-xs text-accent underline mt-1"
+            >
+              Turn off Always-on and restore internet
+            </button>
+          </div>
+        )}
+        {!isConnected && !isConnecting && !isError && settings.permanentKillSwitch && advancedKillSwitchActive && (
+          <div className="text-center mb-2">
+            <p className="text-xs text-muted-foreground">
+              Always-on is blocking your internet until you connect.
+            </p>
+            <button
+              onClick={() => updateSettings({ permanentKillSwitch: false })}
+              className="text-xs text-accent underline mt-1"
+            >
+              Turn off Always-on and restore internet
+            </button>
+          </div>
+        )}
 
         {/* Divider 2 */}
         <div className="h-px mb-4" />

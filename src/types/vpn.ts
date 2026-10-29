@@ -164,6 +164,18 @@ declare global {
       // Resolves to {} (and measures nothing) while the tunnel is up or coming up: probes made
       // then are routed through the connected server and come back inflated.
       measureLatency: (servers: Array<{ id: string; host: string }>) => Promise<Record<string, number>>;
+      relayRequest: (request: {
+        url: string;
+        method: string;
+        headers: Record<string, string>;
+        body: string | null;
+      }) => Promise<{
+        ok: boolean;
+        status?: number;
+        statusText?: string;
+        headers?: Record<string, string | string[]>;
+        bodyBase64?: string;
+      }>;
       // Business SSO: opens the browser to the organization's identity provider and resolves with
       // the one-time code (bound to a PKCE verifier only the main process holds) once the
       // wiredog://sso callback arrives. Rejects with 'SSO_CANCELLED' | 'SSO_NO_ACCOUNT' | 'SSO_FAILED'.

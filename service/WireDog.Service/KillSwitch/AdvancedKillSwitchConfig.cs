@@ -22,6 +22,14 @@ public class AdvancedKillSwitchConfig
     [JsonPropertyName("lastServerEndpoint")]
     public string? LastServerEndpoint { get; set; }
 
+    /// <summary>
+    /// Addresses of the Rescue Relay (a no-log pass-through to the WireDog backend). While the kill
+    /// switch blocks, TCP 443 to exactly these addresses stays permitted so the app can still reach the
+    /// backend. Set by the app from the backend's /app/config; kept here so a boot-time block has them.
+    /// </summary>
+    [JsonPropertyName("apiRelayIps")]
+    public List<string> ApiRelayIps { get; set; } = new();
+
     public static AdvancedKillSwitchConfig Load()
     {
         try

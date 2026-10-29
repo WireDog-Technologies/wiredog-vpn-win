@@ -7,6 +7,72 @@ const API_URL = import.meta.env.MODE === 'development'
 
 const FETCH_TIMEOUT_MS = 15_000;
 
+// --- Rescue Relay -------------------------------------------------------------------------------
+// While a kill switch blocks the network, a direct request to the backend cannot get through. The main
+// process can reach it through the Rescue Relay (a no-log pass-through, certificate still checked
+// against the real hostname). apiFetch tries the direct request and, when that fails with a network
+// error, asks the main process to send the same request through the relay. HTTP error statuses are
+// real answers and are never retried.
+const RECENT_FAILURE_MS = 60_000;
+let apiBlockedHint = false;
+let lastDirectFailureAt = 0;
+
+/** Set while the app knows a kill switch is blocking, so the relay is tried before a slow direct attempt. */
+export function setApiBlockHint(blocked: boolean): void {
+  apiBlockedHint = blocked;
+}
+
+function isNetworkFailure(err: unknown): boolean {
+  return err instanceof TypeError || (err instanceof DOMException && (err.name === 'TimeoutError' || err.name === 'AbortError'));
+}
+
+async function requestViaRelay(url: string, init: RequestInit): Promise<Response | null> {
+  const relay = window.electronAPI?.relayRequest;
+  // A caller that cancelled the request on purpose (AbortError) does not want it sent anywhere else.
+  if (!relay || (init.signal?.aborted && (init.signal.reason as { name?: string } | undefined)?.name === 'AbortError')) return null;
+  if (init.body != null && typeof init.body !== 'string') return null;
+  try {
+    const headers: Record<string, string> = {};
+    new Headers(init.headers).forEach((value, key) => { headers[key] = value; });
+    const result = await relay({ url, method: init.method || 'GET', headers, body: (init.body as string | null | undefined) ?? null });
+    if (!result.ok || result.status === undefined) return null;
+    const responseHeaders = new Headers();
+    for (const [name, value] of Object.entries(result.headers ?? {})) {
+      if (Array.isArray(value)) value.forEach(v => responseHeaders.append(name, v));
+      else if (value != null) responseHeaders.set(name, String(value));
+    }
+    const noBody = result.status < 200 || result.status === 204 || result.status === 205 || result.status === 304;
+    const bytes = noBody ? null : Uint8Array.from(atob(result.bodyBase64 ?? ''), c => c.charCodeAt(0));
+    return new Response(bytes, { status: result.status, statusText: result.statusText ?? '', headers: responseHeaders });
+  } catch {
+    return null;
+  }
+}
+
+async function apiFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  if (!window.electronAPI?.relayRequest) return fetch(url, init);
+
+  const relayFirst = apiBlockedHint || Date.now() - lastDirectFailureAt < RECENT_FAILURE_MS;
+  if (relayFirst) {
+    const viaRelay = await requestViaRelay(url, init);
+    if (viaRelay) return viaRelay;
+  }
+
+  try {
+    const response = await fetch(url, init);
+    lastDirectFailureAt = 0;
+    return response;
+  } catch (err) {
+    if (!isNetworkFailure(err)) throw err;
+    lastDirectFailureAt = Date.now();
+    if (!relayFirst) {
+      const viaRelay = await requestViaRelay(url, init);
+      if (viaRelay) return viaRelay;
+    }
+    throw err;
+  }
+}
+
 interface ApiError {
   message: string;
   status: number;
@@ -117,7 +183,7 @@ async function finishLogin(data: LoginResponseBody): Promise<LoginOutcome> {
 }
 
 export async function login(email: string, password: string): Promise<LoginOutcome> {
-  const response = await fetch(`${API_URL}/auth/login`, {
+  const response = await apiFetch(`${API_URL}/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
@@ -130,7 +196,7 @@ export async function login(email: string, password: string): Promise<LoginOutco
 export async function anonymousLogin(accountNumber: string): Promise<LoginOutcome> {
   // Strip spaces from account number
   const cleanNumber = accountNumber.replace(/\s/g, '');
-  const response = await fetch(`${API_URL}/auth/login`, {
+  const response = await apiFetch(`${API_URL}/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
@@ -146,7 +212,7 @@ export async function anonymousLogin(accountNumber: string): Promise<LoginOutcom
  * survives a wrong code, so the caller can let the user retry.
  */
 export async function verifyTwoFactor(challengeToken: string, code: string): Promise<void> {
-  const response = await fetch(`${API_URL}/auth/2fa/verify`, {
+  const response = await apiFetch(`${API_URL}/auth/2fa/verify`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
@@ -164,7 +230,7 @@ export async function ssoAvailable(email: string): Promise<boolean> {
   const trimmed = email.trim();
   if (!trimmed.includes('@')) return false;
   try {
-    const response = await fetch(`${API_URL}/auth/login/lookup?identifier=${encodeURIComponent(trimmed)}`, {
+    const response = await apiFetch(`${API_URL}/auth/login/lookup?identifier=${encodeURIComponent(trimmed)}`, {
       method: 'GET',
       credentials: 'include',
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
@@ -178,7 +244,7 @@ export async function ssoAvailable(email: string): Promise<boolean> {
 
 /** Redeems the one-time code from the wiredog://sso callback, proving possession of the PKCE verifier. */
 export async function exchangeSsoCode(code: string, codeVerifier: string): Promise<void> {
-  const response = await fetch(`${API_URL}/auth/sso/exchange`, {
+  const response = await apiFetch(`${API_URL}/auth/sso/exchange`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
@@ -191,7 +257,7 @@ export async function exchangeSsoCode(code: string, codeVerifier: string): Promi
 /** Replaces a temporary (admin-provisioned) password. The backend clears mustChangePassword. */
 export async function changePassword(currentPassword: string, newPassword: string): Promise<void> {
   const headers = await getHeaders();
-  const response = await fetch(`${API_URL}/auth/password`, {
+  const response = await apiFetch(`${API_URL}/auth/password`, {
     method: 'PATCH',
     headers,
     credentials: 'include',
@@ -204,7 +270,7 @@ export async function changePassword(currentPassword: string, newPassword: strin
 // MARK: Password reset
 
 export async function forgotPassword(email: string): Promise<void> {
-  const response = await fetch(`${API_URL}/auth/forgot-password`, {
+  const response = await apiFetch(`${API_URL}/auth/forgot-password`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email }),
@@ -215,7 +281,7 @@ export async function forgotPassword(email: string): Promise<void> {
 
 /** Returns true when the account has 2FA on, so the reset must also carry a current 2FA code. */
 export async function verifyResetCode(email: string, code: string): Promise<boolean> {
-  const response = await fetch(`${API_URL}/auth/verify-reset-code`, {
+  const response = await apiFetch(`${API_URL}/auth/verify-reset-code`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email, code }),
@@ -228,7 +294,7 @@ export async function verifyResetCode(email: string, code: string): Promise<bool
 export async function resetPassword(email: string, code: string, newPassword: string, twoFactorCode?: string): Promise<void> {
   const body: Record<string, string> = { email, code, newPassword };
   if (twoFactorCode) body.twoFactorCode = twoFactorCode;
-  const response = await fetch(`${API_URL}/auth/reset-password`, {
+  const response = await apiFetch(`${API_URL}/auth/reset-password`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -248,7 +314,7 @@ export async function dashboardHandoffUrl(): Promise<string> {
   const destination = DASHBOARD_URL;
   try {
     const headers = await getHeaders();
-    const response = await fetch(`${API_URL}/auth/handoff-token`, {
+    const response = await apiFetch(`${API_URL}/auth/handoff-token`, {
       method: 'POST',
       headers,
       credentials: 'include',
@@ -265,7 +331,7 @@ export async function dashboardHandoffUrl(): Promise<string> {
 
 export async function logout(): Promise<void> {
   const headers = await getHeaders();
-  await fetch(`${API_URL}/auth/logout`, {
+  await apiFetch(`${API_URL}/auth/logout`, {
     method: 'POST',
     headers,
     credentials: 'include',
@@ -281,7 +347,7 @@ export async function logout(): Promise<void> {
 export async function registerStandard(email: string, password: string, referralCode?: string): Promise<void> {
   const body: Record<string, string> = { email, password, platform: 'Windows' };
   if (referralCode) body.referralCode = referralCode;
-  const response = await fetch(`${API_URL}/auth/register/standard`, {
+  const response = await apiFetch(`${API_URL}/auth/register/standard`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
@@ -292,7 +358,7 @@ export async function registerStandard(email: string, password: string, referral
 }
 
 export async function registerAnonymous(): Promise<string> {
-  const response = await fetch(`${API_URL}/auth/register/anonymous`, {
+  const response = await apiFetch(`${API_URL}/auth/register/anonymous`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
@@ -310,7 +376,7 @@ export async function registerAnonymous(): Promise<string> {
  */
 export async function fetchCurrentUser(): Promise<MeResponse> {
   const headers = await getHeaders();
-  const response = await fetch(`${API_URL}/auth/me`, {
+  const response = await apiFetch(`${API_URL}/auth/me`, {
     method: 'GET',
     headers,
     credentials: 'include',
@@ -321,7 +387,7 @@ export async function fetchCurrentUser(): Promise<MeResponse> {
 export async function getCurrentUser(): Promise<MeResponse | null> {
   try {
     const headers = await getHeaders();
-    const response = await fetch(`${API_URL}/auth/me`, {
+    const response = await apiFetch(`${API_URL}/auth/me`, {
       method: 'GET',
       headers,
       credentials: 'include',
@@ -356,7 +422,7 @@ export async function getServers(): Promise<ServerResponse[]> {
   const headers = await getHeaders();
   // gateways=1 opts in to organization "gateway" entries (named Dedicated IPs). Without it the
   // backend keeps returning the plain list.
-  const response = await fetch(`${API_URL}/vpn/servers?gateways=1`, {
+  const response = await apiFetch(`${API_URL}/vpn/servers?gateways=1`, {
     method: 'GET',
     headers,
     credentials: 'include',
@@ -377,7 +443,7 @@ export interface ReportIssuePayload {
 
 export async function reportIssue(payload: ReportIssuePayload): Promise<void> {
   const headers = await getHeaders();
-  const response = await fetch(`${API_URL}/support/report-issue`, {
+  const response = await apiFetch(`${API_URL}/support/report-issue`, {
     method: 'POST',
     headers,
     credentials: 'include',
@@ -404,7 +470,7 @@ export interface AppConfigResponse {
 }
 
 export async function getAppConfig(): Promise<AppConfigResponse> {
-  const response = await fetch(`${API_URL}/app/config`, {
+  const response = await apiFetch(`${API_URL}/app/config`, {
     method: 'GET',
     headers: { 'Content-Type': 'application/json' },
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
@@ -419,7 +485,7 @@ export async function getAppConfig(): Promise<AppConfigResponse> {
  */
 export async function getAccountMessages(): Promise<Announcement[]> {
   const headers = await getHeaders();
-  const response = await fetch(`${API_URL}/auth/messages`, {
+  const response = await apiFetch(`${API_URL}/auth/messages`, {
     method: 'GET',
     headers,
     credentials: 'include',
@@ -429,7 +495,7 @@ export async function getAccountMessages(): Promise<Announcement[]> {
 }
 
 export async function getAnnouncements(): Promise<Announcement[]> {
-  const response = await fetch(`${API_URL}/app/announcements`, {
+  const response = await apiFetch(`${API_URL}/app/announcements`, {
     method: 'GET',
     headers: { 'Content-Type': 'application/json' },
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),

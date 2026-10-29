@@ -362,6 +362,16 @@ class ServiceClient {
   }
 
   /**
+   * Tell the service which Rescue Relay addresses the kill switch must keep reachable (TCP 443).
+   * The service validates and caps the list; an empty list switches the relay permits off.
+   * @param {string[]} ips
+   * @returns {Promise<{success: boolean}>}
+   */
+  async setApiRelays(ips) {
+    return this.request('setApiRelays', { ips });
+  }
+
+  /**
    * Emergency reset: nuke ALL WFP filters (fail-safe for testing)
    * @returns {Promise<{success: boolean}>}
    */

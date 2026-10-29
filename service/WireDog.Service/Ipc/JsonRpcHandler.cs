@@ -36,7 +36,7 @@ public class JsonRpcHandler
     {
         "connect", "disconnect", "emergencyReset",
         "enableKillSwitch", "disableKillSwitch",
-        "enableAdvancedKillSwitch", "disableAdvancedKillSwitch"
+        "enableAdvancedKillSwitch", "disableAdvancedKillSwitch", "setApiRelays"
     };
 
     // Track current server IP for cleanup
@@ -130,7 +130,7 @@ public class JsonRpcHandler
                 try
                 {
                     var fakeRequest = new JsonRpcRequest { Method = "connect", Params = connectParams };
-                    await HandleConnectAsync(fakeRequest, cts.Token);
+                    await HandleConnectAsync(fakeRequest, cts.Token, keepBlockOnFailure: true);
                     _logger.LogInformation("[BootReconnect] Connected successfully on attempt {Attempt}!", attempt);
                     return;
                 }
@@ -326,6 +326,7 @@ public class JsonRpcHandler
             "disableKillSwitch" => HandleDisableKillSwitch(),
             "enableAdvancedKillSwitch" => HandleEnableAdvancedKillSwitch(),
             "disableAdvancedKillSwitch" => HandleDisableAdvancedKillSwitch(),
+            "setApiRelays" => HandleSetApiRelays(request),
             "getDnsFilterStats" => HandleGetDnsFilterStats(),
             "getDiagnostics" => HandleGetDiagnostics(),
             "emergencyReset" => await HandleEmergencyResetAsync(cancellationToken),
@@ -358,11 +359,23 @@ public class JsonRpcHandler
         };
     }
 
-    private async Task<ConnectResult> HandleConnectAsync(JsonRpcRequest request, CancellationToken cancellationToken)
+    // keepBlockOnFailure: set by the service's own reconnect loops. A failed attempt there must not
+    // lift the kill switch (the loop waits before the next try, and the internet would be open for
+    // that whole wait); it re-enters the Bootstrap block instead.
+    private async Task<ConnectResult> HandleConnectAsync(JsonRpcRequest request, CancellationToken cancellationToken, bool keepBlockOnFailure = false)
     {
         if (_connectionState.Current.Status == ConnectionStatus.Connected)
         {
             throw new JsonRpcException(JsonRpcErrorCodes.AlreadyConnected, "Already connected");
+        }
+
+        // A connect arriving from the app carries fresh credentials. If the service is in the middle of
+        // its own auto-reconnect (which replays the old, possibly deleted, credentials), stop that loop
+        // so the two do not race. The loop's own calls pass its token and are left alone.
+        if (_reconnectCts != null && cancellationToken != _reconnectCts.Token)
+        {
+            _logger.LogInformation("[AutoReconnect] New connect request received, stopping the service's own reconnect loop");
+            _reconnectCts.Cancel();
         }
 
         var paramsJson = JsonSerializer.Serialize(request.Params);
@@ -373,6 +386,11 @@ public class JsonRpcHandler
         {
             throw new JsonRpcException(JsonRpcErrorCodes.InvalidParams, "Config is required");
         }
+
+        // If a block is already holding the internet (reconnecting, gave up, or always-on), a failed
+        // attempt, whoever started it, must leave that block up rather than lift it.
+        keepBlockOnFailure |= _killSwitch.State == KillSwitchStateEnum.Bootstrap
+            || _killSwitch.State == KillSwitchStateEnum.PersistentBlock;
 
         _connectionState.SetConnecting(connectParams.ServerId);
 
@@ -738,7 +756,23 @@ public class JsonRpcHandler
             try { _killSwitch.RemovePhysicalInterfacePermit(); } catch { /* best effort */ }
             _killSwitch.DisableDnsLeakProtection();
             _killSwitch.DisableIpv6LeakProtection();
-            _killSwitch.Disable();
+            if (keepBlockOnFailure && connectParams.KillSwitch)
+            {
+                // EnableBootstrap replaces whatever filters exist in one step (and suspends an
+                // always-on persistent block for the next attempt), so there is no open window.
+                var failedEndpoint = connectParams.Config.Endpoint.Split(':');
+                var failedPort = failedEndpoint.Length > 1 && ushort.TryParse(failedEndpoint[1], out var fp) ? fp : (ushort)443;
+                try { _killSwitch.EnableBootstrap(IPAddress.TryParse(failedEndpoint[0], out _) ? failedEndpoint[0] : "", failedPort, isTcp: false); }
+                catch (Exception bootstrapEx)
+                {
+                    _logger.LogError(bootstrapEx, "[AutoReconnect] Could not hold the block after a failed attempt");
+                    _killSwitch.Disable();
+                }
+            }
+            else
+            {
+                _killSwitch.Disable();
+            }
             await _wireGuard.DisconnectAsync(cancellationToken);
 
             throw new JsonRpcException(JsonRpcErrorCodes.ConnectionFailed, ex.Message);
@@ -766,6 +800,14 @@ public class JsonRpcHandler
         }
 
         // Handle PersistentBlock → disable advanced KS (user wants full disconnect)
+        if (_killSwitch.State == KillSwitchStateEnum.PersistentBlock && !disableProtection)
+        {
+            // Always-on: a plain disconnect keeps the block. Only turning Always-on off lifts it.
+            _logger.LogInformation("[AdvKS] Disconnect from PersistentBlock — keeping the block (protection not disabled)");
+            _connectionState.SetDisconnected();
+            return new { success = true };
+        }
+
         if (_killSwitch.State == KillSwitchStateEnum.PersistentBlock)
         {
             _logger.LogInformation("[AdvKS] Disconnect from PersistentBlock — disabling persistent filters");
@@ -971,6 +1013,24 @@ public class JsonRpcHandler
         return new { success = true, advancedKillSwitchEnabled = true };
     }
 
+    // Rescue Relay addresses (from the backend's /app/config, relayed by the app). Validated and capped
+    // inside KillSwitchManager.SetApiRelays; an empty list switches the relay permits off.
+    private object HandleSetApiRelays(JsonRpcRequest request)
+    {
+        var paramsJson = JsonSerializer.Serialize(request.Params);
+        using var doc = JsonDocument.Parse(paramsJson);
+        var ips = new List<string>();
+        if (doc.RootElement.TryGetProperty("ips", out var ipsElem) && ipsElem.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in ipsElem.EnumerateArray())
+            {
+                if (item.ValueKind == JsonValueKind.String && item.GetString() is { } s) ips.Add(s);
+            }
+        }
+        _killSwitch.SetApiRelays(ips);
+        return new { success = true };
+    }
+
     private object HandleDisableAdvancedKillSwitch()
     {
         _killSwitch.SetAdvancedModeEnabled(false);
@@ -1040,7 +1100,7 @@ public class JsonRpcHandler
             {
                 // Re-run the connect using the stored params (HandleConnectAsync calls SetConnecting internally)
                 var fakeRequest = new JsonRpcRequest { Method = "connect", Params = connectParams };
-                await HandleConnectAsync(fakeRequest, cancellationToken);
+                await HandleConnectAsync(fakeRequest, cancellationToken, keepBlockOnFailure: true);
                 _logger.LogInformation("[AutoReconnect] Reconnect successful on attempt {Attempt}", attempt);
                 return;
             }
@@ -1048,7 +1108,8 @@ public class JsonRpcHandler
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "[AutoReconnect] Attempt {Attempt} failed", attempt);
-                // HandleConnectAsync's catch already called Disable() — next attempt will re-enable bootstrap
+                // keepBlockOnFailure: HandleConnectAsync's catch re-entered the Bootstrap block, so the
+                // internet stays blocked while we wait for the next attempt
             }
         }
 
@@ -1056,7 +1117,9 @@ public class JsonRpcHandler
 
         // Give-up behavior depends on kill switch type:
         // Always-on KS → transition to PersistentBlock (protected, user must manually reconnect)
-        // Standard KS  → full cleanup (restore internet, user is unprotected)
+        // Standard KS  → stay blocked in Bootstrap with an error. The user restores the internet with Disconnect, which does the
+        //                full cleanup (HandleDisconnectAsync). Opening the internet here, unasked,
+        //                would break the promise that a dropped VPN never leaks.
         if (_killSwitch.IsAdvancedModeEnabled)
         {
             _logger.LogInformation("[AutoReconnect] Always-on KS enabled — activating PersistentBlock");
@@ -1065,20 +1128,10 @@ public class JsonRpcHandler
         }
         else
         {
-            _logger.LogInformation("[AutoReconnect] Standard KS — cleaning up to restore internet");
-            try { _splitTunnel.DisableAppSplitTunneling(); } catch { }
-            try { _splitTunnel.DisableIpSplitTunneling(); } catch { }
-            _killSwitch.DisableDnsLeakProtection();
-            _killSwitch.DisableIpv6LeakProtection();
-            _killSwitch.Disable();
-            await _wireGuard.DisconnectAsync(CancellationToken.None);
-            if (_currentServerIp != null)
-            {
-                try { _firewallManager.RemoveServerRule(_currentServerIp); } catch { }
-                _currentServerIp = null;
-            }
-            _lastConnectParams = null;
-            _connectionState.SetDisconnected();
+            _logger.LogInformation("[AutoReconnect] Standard KS — staying blocked until the user disconnects or reconnects");
+            // The last failed attempt already tore down split tunneling and the tunnel and re-entered
+            // Bootstrap; only the state needs to say why the internet is paused.
+            _connectionState.SetError("Auto-reconnect failed — internet paused for protection. Disconnect to restore it.");
         }
     }
 

@@ -279,17 +279,44 @@ public class WireGuardManager : IDisposable
         int consecutiveFailures = 0;
         const int failureThreshold = 2; // Require 2 consecutive failures (10 seconds) to avoid false positives
 
+        // Sleep detection. The machine sleeping (lid closed, hibernate) freezes this loop, so a gap far
+        // longer than the 5s tick between two checks means the machine just woke up. The handshake is
+        // then stale only because nothing could refresh it, and the network is usually not back yet:
+        // WireGuard re-handshakes on its own once it is. Give it a grace period instead of declaring
+        // the connection lost and tearing down a tunnel that would have recovered.
+        var sleepGapThreshold = TimeSpan.FromSeconds(30);
+        var resumeGracePeriod = TimeSpan.FromSeconds(60);
+        var lastTick = DateTime.UtcNow;
+        var graceUntil = DateTime.MinValue;
+
         while (!cancellationToken.IsCancellationRequested && IsConnected)
         {
             try
             {
                 await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
 
+                var now = DateTime.UtcNow;
+                if (now - lastTick > sleepGapThreshold)
+                {
+                    graceUntil = now + resumeGracePeriod;
+                    consecutiveFailures = 0;
+                    _logger.LogInformation("[HEALTH] Resume from sleep detected (gap {Gap}s) â€” holding off health checks for {Grace}s",
+                        (int)(now - lastTick).TotalSeconds, (int)resumeGracePeriod.TotalSeconds);
+                }
+                lastTick = now;
+                var inResumeGrace = now < graceUntil;
+
                 // Check 1: Does the adapter still exist?
                 var interfaces = NetworkInterface.GetAllNetworkInterfaces();
                 var adapterExists = interfaces.Any(i =>
                     i.Name.Equals(_tunnelName, StringComparison.OrdinalIgnoreCase) &&
                     i.OperationalStatus == OperationalStatus.Up);
+
+                if (!adapterExists && inResumeGrace)
+                {
+                    _logger.LogDebug("[HEALTH] Adapter not up yet, still in resume grace period");
+                    continue;
+                }
 
                 if (!adapterExists)
                 {
@@ -320,6 +347,12 @@ public class WireGuardManager : IDisposable
                 catch
                 {
                     // ReadStats can fail if adapter handle is stale
+                }
+
+                if (!handshakeFresh && inResumeGrace)
+                {
+                    _logger.LogDebug("[HEALTH] Handshake stale, still in resume grace period");
+                    continue;
                 }
 
                 if (!handshakeFresh)
