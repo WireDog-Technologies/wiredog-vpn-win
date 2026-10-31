@@ -3,6 +3,7 @@ import { Loader2, ArrowDown, ArrowUp, Server, Activity, Signal } from 'lucide-re
 import { Button } from '@/components/ui/button';
 import { ServerLocation, isDedicatedServer } from '@/types/vpn';
 import { getUSStateFlag } from '@/lib/utils';
+import { openPricingPage } from '@/lib/api';
 
 // Parse WireGuard byte strings like "1.5 MiB" to bytes
 const parseWireGuardBytes = (str: string): number => {
@@ -93,6 +94,8 @@ interface BottomToolbarProps {
   isConnecting: boolean;
   connectedServer: ServerLocation | null;
   isSubscriptionActive: boolean;
+  // True for a personal account with no plan: Connect then opens the website's plan picker.
+  offerSubscription: boolean;
   onConnect: () => void;
   onCancelConnect: () => void;
   onDisconnect: () => void;
@@ -110,6 +113,7 @@ const BottomToolbar: React.FC<BottomToolbarProps> = ({
   isConnecting,
   connectedServer,
   isSubscriptionActive,
+  offerSubscription,
   onConnect,
   onCancelConnect,
   onDisconnect,
@@ -157,8 +161,10 @@ const BottomToolbar: React.FC<BottomToolbarProps> = ({
             <Button
               variant="outline"
               size="sm"
-              disabled
-              className="flex-shrink-0 text-xs font-semibold tracking-wide opacity-50 cursor-not-allowed"
+              disabled={!offerSubscription}
+              onClick={() => { void openPricingPage(); }}
+              title={offerSubscription ? 'Choose a plan' : undefined}
+              className={`flex-shrink-0 text-xs font-semibold tracking-wide ${offerSubscription ? '' : 'opacity-50 cursor-not-allowed'}`}
             >
               Connect
             </Button>

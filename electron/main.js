@@ -1039,6 +1039,7 @@ async function initializeSettingsStore() {
         protocol: 'wireguard',
         killSwitch: false,
         autoConnect: false,
+        reconnectToAnotherServer: true,
         splitTunneling: {
           enabled: false,
           mode: 'exclude',
@@ -1057,6 +1058,16 @@ async function initializeSettingsStore() {
       vpnService.setAuthTokenProvider(() => getAuthToken());
     } catch (err) {
       log.warn('VPN: setAuthTokenProvider failed:', err.message);
+    }
+    // The connection config cache and the pending-disconnect ledger (device-counter protection) live in
+    // their own store, created here because electron-store can only be loaded with import().
+    try {
+      vpnService.setSessionStore(new Store({
+        name: 'vpn-session',
+        encryptionKey: 'wiredog-vpn-session-v1'
+      }));
+    } catch (err) {
+      log.warn('VPN: setSessionStore failed:', err.message);
     }
     // Lets VPNService read the last session main.js persisted, as a fallback when releasing a slot.
     try {

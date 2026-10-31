@@ -31,6 +31,31 @@ export function lostOrganizationAccess(user: User | null): Exclude<OrganizationA
   return access === 'inactive' || access === 'revoked' ? access : null;
 }
 
+/**
+ * A personal account with no active plan: the only kind the app sends to the website to buy one.
+ * Organization accounts never are, whether the organization's plan is active, lapsed, or the seat
+ * was revoked: their subscription is the organization's to manage, not theirs to buy.
+ */
+export function shouldOfferSubscription(user: User | null, isSubscriptionActive: boolean): boolean {
+  if (!user || isSubscriptionActive) return false;
+  return !isOrganizationMember(user) && lostOrganizationAccess(user) === null;
+}
+
+/**
+ * The line under "Get a WireDog subscription": what the backend says about this account's free trial.
+ * Only the backend decides eligibility (/auth/me trialIneligibleReason), so a trial is never promised
+ * to an account that cannot start one. Null means: say nothing extra.
+ */
+export function trialNote(user: User | null): { text: string; eligible: boolean } | null {
+  if (!user) return null;
+  const reason = user.trialIneligibleReason;
+  if (reason === undefined) return null; // the backend did not say
+  if (reason === null) return { text: 'Your account is eligible for a free trial', eligible: true };
+  if (reason === 'anonymous') return { text: 'Anonymous accounts are not eligible for a free trial', eligible: false };
+  if (reason === 'unverified') return { text: 'Verify your email to unlock your free trial', eligible: true };
+  return null; // used, already paid, revoked, or trials switched off: nothing to advertise
+}
+
 export function organizationAccessMessage(access: Exclude<OrganizationAccess, 'active'>): string {
   return access === 'inactive'
     ? "Your organization's WireDog subscription isn't active right now. Contact your administrator."

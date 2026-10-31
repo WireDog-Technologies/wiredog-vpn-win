@@ -69,6 +69,7 @@ const defaultSettings: VPNSettings = {
   permanentKillSwitch: false,
   autoConnect: false,
   autoReconnect: false, // No longer user-configurable; auto-reconnect is always-on when kill switch active
+  reconnectToAnotherServer: true,
   splitTunneling: defaultSplitTunneling,
   ipv6Enabled: true,
   ipv6LeakProtection: true,
@@ -101,6 +102,7 @@ function mapMeResponseToUser(me: MeResponse): User {
     organizationName: me.organizationName ?? undefined,
     organizationRole: me.organizationRole ?? undefined,
     organizationAccess: api.parseOrganizationAccess(me.organizationAccess),
+    trialIneligibleReason: me.trialIneligibleReason,
   };
 }
 
@@ -442,7 +444,11 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             : lookedUp;
           setConnection(prev => ({
             status: 'connected',
-            server: prev.server || fullServer || status.session!.server,
+            // Keep the server the user picked, unless the session is really on a different one (an
+            // automatic move to another server after the first one failed): then show the new one.
+            server: prev.server && (!serverId || prev.server.id === serverId)
+              ? prev.server
+              : (fullServer || status.session!.server),
             ipAddress: status.session!.publicIp || prev.ipAddress || '',
             sessionStart: prev.sessionStart || (status.session!.connectedAt ? new Date(status.session!.connectedAt) : null),
             dataIn: prev.dataIn,
@@ -466,9 +472,13 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           // "disconnected" before the connection proceeds. Resetting here would cause
           // the UI to flicker back to UNPROTECTED.
           setConnection(prev => {
-            if (prev.status === 'connecting') return prev;
+            // ...unless the auto-reconnect loop has really given up: then there is nothing left to wait for.
+            if (prev.status === 'connecting' && !status.reconnectGaveUp) return prev;
             return defaultConnection;
           });
+          if (status.reconnectGaveUp) {
+            setConnectionError("Couldn't reconnect to WireDog VPN. Check your connection or choose another server.");
+          }
         }
       };
 

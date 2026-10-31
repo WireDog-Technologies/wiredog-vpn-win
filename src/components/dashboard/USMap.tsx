@@ -8,6 +8,7 @@ import { TbTriangleInvertedFilled } from "react-icons/tb";
 import mapSvg from '../../../map.svg';
 import BottomToolbar, { parseWireGuardBytes } from '@/components/layout/BottomToolbar';
 import { getUSStateFlag } from '@/lib/utils';
+import { shouldOfferSubscription } from '@/lib/account';
 
 // SVG aspect ratio (2000x1200 viewBox)
 const SVG_ASPECT_RATIO = 2000 / 1200;
@@ -146,7 +147,7 @@ const ServerNode: React.FC<ServerNodeProps> = ({ server, isActive, isConnecting,
 
 
 const USMap: React.FC = () => {
-  const { connection, connect, cancelConnect, disconnect, selectedServer, setSelectedServer, selectServer, isSwitchingServer, isSubscriptionActive } = useVPN();
+  const { user, connection, connect, cancelConnect, disconnect, selectedServer, setSelectedServer, selectServer, isSwitchingServer, isSubscriptionActive } = useVPN();
   const { data: servers = [] } = useServersWithLatency();
   const { data: recommendedServers = [] } = useRecommendedServers();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -348,6 +349,7 @@ const USMap: React.FC = () => {
             isConnecting={isConnecting}
             connectedServer={connection.server}
             isSubscriptionActive={isSubscriptionActive}
+            offerSubscription={shouldOfferSubscription(user, isSubscriptionActive)}
             onConnect={handleConnect}
             onCancelConnect={handleCancelConnect}
             onDisconnect={handleDisconnect}

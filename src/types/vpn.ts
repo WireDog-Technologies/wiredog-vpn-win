@@ -56,6 +56,9 @@ export interface VPNSettings {
   permanentKillSwitch: boolean;
   autoConnect: boolean;
   autoReconnect: boolean;
+  // When the current server keeps failing to reconnect, connect to the fastest other server instead.
+  // On by default; the user can turn it off, since the location they appear in changes.
+  reconnectToAnotherServer: boolean;
   splitTunneling: SplitTunnelingConfig;
   ipv6Enabled?: boolean;
   ipv6LeakProtection?: boolean;
@@ -90,6 +93,9 @@ export interface User {
   organizationName?: string;
   organizationRole?: string;
   organizationAccess?: OrganizationAccess;
+  // From /auth/me: why the account cannot start a free trial, or null when it can. Undefined when
+  // the backend does not say, which the app treats as 'show nothing'.
+  trialIneligibleReason?: string | null;
 }
 
 // Currently published Privacy Policy / Terms of Service versions. Opaque strings, only compared
@@ -127,6 +133,8 @@ export interface VPNStatusUpdate {
   advancedKillSwitchEnabled?: boolean;
   advancedKillSwitchActive?: boolean;
   isReconnecting?: boolean;
+  // The auto-reconnect loop used up all its attempts: the UI should stop showing 'connecting'.
+  reconnectGaveUp?: boolean;
 }
 
 export interface VPNStats {

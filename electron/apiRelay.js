@@ -15,8 +15,9 @@ const tls = require('tls');
 const log = require('electron-log');
 
 const RELAY_PORT = 443;
-const RELAY_TIMEOUT_MS = 8000;
+const RELAY_TIMEOUT_MS = 6000;
 const RECENT_FAILURE_MS = 60 * 1000;
+const DIRECT_RETRY_DELAY_MS = 1500;
 const MAX_RELAYS = 4;
 const STORE_KEY = 'apiRelays';
 
@@ -158,6 +159,14 @@ async function relayRequest(url, { method = 'GET', headers = {}, body = null } =
   throw lastErr || new Error('no relay answered');
 }
 
+// Every request that actually travelled through the relay is logged (method, path without the query
+// string, status), so a test or a support case can see the relay at work instead of inferring it.
+function logRelayed(method, url, status) {
+  let path = '';
+  try { path = new URL(url).pathname; } catch { /* leave empty */ }
+  log.info(`[Relay] relayed ${method || 'GET'} ${path} -> ${status}`);
+}
+
 function toResponse(result) {
   const headers = new Headers();
   for (const [name, value] of Object.entries(result.headers || {})) {
@@ -186,9 +195,14 @@ async function apiFetch(url, init = {}) {
   const relayFirst = blockedHint || Date.now() - lastDirectFailureAt < RECENT_FAILURE_MS;
   if (relayFirst) {
     try {
-      return toResponse(await relayRequest(url, requestInit(init)));
+      const result = await relayRequest(url, requestInit(init));
+      logRelayed(init.method, url, result.status);
+      return toResponse(result);
     } catch (err) {
       log.warn(`[Relay] Relay request failed, trying direct: ${err.message}`);
+      // The relay did not help (for example the whole network is still coming back after a wake-up),
+      // so stop preferring it: the next request goes direct first instead of waiting on it again.
+      lastDirectFailureAt = 0;
     }
   }
 
@@ -196,13 +210,30 @@ async function apiFetch(url, init = {}) {
     const response = await fetch(url, init);
     lastDirectFailureAt = 0;
     return response;
-  } catch (err) {
+  } catch (firstErr) {
+    let err = firstErr;
     if (!isNetworkError(err)) throw err;
-    lastDirectFailureAt = Date.now();
     if (relayFirst) throw err; // the relay was already tried
+    // A request that fails at once (not a timeout) is often just the tunnel coming up or going down
+    // (a normal connect or disconnect). Give the direct path a moment and one more try before the
+    // relay, which also keeps the relay out of ordinary traffic.
+    if (err instanceof TypeError) {
+      await new Promise(resolve => setTimeout(resolve, DIRECT_RETRY_DELAY_MS));
+      try {
+        const response = await fetch(url, init);
+        lastDirectFailureAt = 0;
+        return response;
+      } catch (secondErr) {
+        if (!isNetworkError(secondErr)) throw secondErr;
+        err = secondErr;
+      }
+    }
+    lastDirectFailureAt = Date.now();
     try {
       log.info('[Relay] Direct request failed, using the relay');
-      return toResponse(await relayRequest(url, requestInit(init)));
+      const result = await relayRequest(url, requestInit(init));
+      logRelayed(init.method, url, result.status);
+      return toResponse(result);
     } catch (relayErr) {
       log.warn(`[Relay] Relay request failed: ${relayErr.message}`);
       throw err;
@@ -224,6 +255,7 @@ async function relayForRenderer({ url, method, headers, body }) {
       headers: headers && typeof headers === 'object' ? headers : {},
       body: typeof body === 'string' ? body : null,
     });
+    logRelayed(method, url, result.status);
     return {
       ok: true,
       status: result.status,

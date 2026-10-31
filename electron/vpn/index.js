@@ -29,8 +29,11 @@ class UnauthorizedError extends Error {
 // the session on the backend. This is the default for a backend that does not report its lease; a
 // backend that does (leaseHours in the /vpn/connect response) sets the limit to the lease minus an hour.
 const LONG_SLEEP_MS = 11 * 60 * 60 * 1000;
-// Reconnect attempts on the same server before Auto-Connect users are moved to another server.
-const FALLBACK_AFTER_ATTEMPTS = 3;
+// Failed reconnect attempts on the same server before a user with Auto-Reconnect on is moved to another server.
+const FALLBACK_AFTER_ATTEMPTS = 2;
+// How long a reconnect attempt waits for the dropped session's release to finish before asking for a
+// new one. The wait only matters at the 5-device limit; a refusal there just retries on the next attempt.
+const RELEASE_WAIT_MS = 2000;
 
 const CONNECT_FORBIDDEN_MESSAGES = {
   two_factor_setup_required: 'Your organization requires two-factor authentication. Set it up on your dashboard, then try again.',
@@ -66,6 +69,11 @@ class VPNService {
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 10;
     this.reconnectBaseDelay = 1.0; // seconds
+    // Set when the last reconnect attempt failed because of the SERVER (the backend could not set a
+    // session up on the node, or the tunnel could not be established), not the user's own network.
+    this._lastAttemptServerSide = false;
+    // Servers that already failed during this reconnect, so a later attempt does not pick them again.
+    this._reconnectExcluded = new Set();
     this.reconnectMaxDelay = 15.0; // seconds
     this.minimumStableConnectionDuration = 30; // seconds — a connection that drops before this never really established
     this.disconnectNotifyDelayMs = 1500; // time for tunnel to fully stop before notifying backend
@@ -83,6 +91,9 @@ class VPNService {
     // (a reconnect about to ask for a new one) can wait for it instead of racing it.
     this._cleanupInFlight = new Map();
     this.authExpired = false; // set when the backend rejected our token during an auto-reconnect
+    // Set when the auto-reconnect loop used up all its attempts. The screen needs to be told, because the
+    // service by then simply reports 'disconnected', which the UI ignores while it still shows 'connecting'.
+    this.reconnectGaveUp = false;
     this.hasHandledFirstFocusEvent = false;
 
     // Log API URL for debugging
@@ -252,18 +263,17 @@ class VPNService {
     }
   }
 
-  // Lazy-init a separate electron-store for the connection config cache.
-  // Must be lazy because electron-store needs app to be ready before use.
-  // Also holds the pending-disconnect ledger (see below) — reusing this store rather than
-  // adding a second injected store, since VPNService already owns it.
+  /**
+   * Inject the store for the connection config cache and the pending-disconnect ledger (see below).
+   * electron-store is ESM-only, so it cannot be require()d here; main.js creates it (dynamic import,
+   * after the app is ready) and hands it over. Until then the cache and ledger calls fail softly.
+   */
+  setSessionStore(store) {
+    this._sessionStore = store;
+  }
+
   _getSessionStore() {
-    if (!this._sessionStore) {
-      const Store = require('electron-store');
-      this._sessionStore = new Store({
-        name: 'vpn-session',
-        encryptionKey: 'wiredog-vpn-session-v1'
-      });
-    }
+    if (!this._sessionStore) throw new Error('session store not initialized yet');
     return this._sessionStore;
   }
 
@@ -613,6 +623,7 @@ class VPNService {
 
     this.connectedSince = null;
     this.authExpired = false;
+    this.reconnectGaveUp = false;
     if (!this.isReconnecting) {
       this.userInitiatedDisconnect = false;
       this.reconnectAttempts = 0;
@@ -691,7 +702,10 @@ class VPNService {
             forbidden.code = error.code;
             throw forbidden;
           }
-          throw new Error(error.error || `API error: ${response.status}`);
+          const failure = new Error(error.error || `API error: ${response.status}`);
+          // A 5xx here means the backend could not set the session up on the node: that server is the problem.
+          failure.serverSide = response.status >= 500;
+          throw failure;
         }
 
         const responseData = await response.json();
@@ -702,10 +716,13 @@ class VPNService {
         // over it orphans that increment until something else releases it: the classic counter leak.
         // Release anything else still held (in memory, or the last session main.js persisted): this
         // is the last chance before the new session overwrites it.
+        // (Sessions the backend already confirmed released are skipped, so the log only warns about a
+        // real leak risk: a drop releases the old session a moment before the reconnect claims a new one.)
+        const alreadyReleased = this._releasedSessionIds();
         const supersededIds = new Set([
           this.currentSession?.sessionId,
           this.configStore?.get('lastSession')?.sessionId,
-        ].filter(id => id && id !== sessionId));
+        ].filter(id => id && id !== sessionId && !alreadyReleased.includes(id)));
         for (const oldId of supersededIds) {
           log.warn(`CONN_COUNTER: /connect granted session ${this._short(sessionId)} but ${this._short(oldId)} was never released — releasing the old one`);
           this.cleanupOrphanedSession(oldId, 'superseded by a new connection', { immediate: true });
@@ -756,7 +773,14 @@ class VPNService {
       log.info('  - Kill Switch Enabled:', settings.killSwitch);
       log.info('  - Local Mode:', settings.localMode || false);
       log.info('  - Split Tunneling:', splitTunneling ? `${splitTunneling.mode} mode, ${splitTunneling.apps.length} apps, ${splitTunneling.ips.length} IPs` : 'disabled');
-      const result = await serviceClient.vpnConnect(serverId, config, settings.killSwitch, settings.localMode || false, splitTunneling);
+      let result;
+      try {
+        result = await serviceClient.vpnConnect(serverId, config, settings.killSwitch, settings.localMode || false, splitTunneling);
+      } catch (serviceErr) {
+        // -1003 = the service could not bring the tunnel up with this server (no handshake).
+        if (serviceErr && serviceErr.code === -1003) serviceErr.serverSide = true;
+        throw serviceErr;
+      }
 
       // The tunnel just came up — if a cancel landed in the narrow window right around this
       // call, tear it back down via the catch block's cleanup below rather than leaving an
@@ -793,7 +817,7 @@ class VPNService {
       this.reconnectAttempts = 0;
 
       apiRelay.setBlockedHint(false);
-      log.info(`VPN: Connected successfully (session=${this._short(sessionId)})`);
+      log.info(`VPN: Connected successfully (session=${this._short(sessionId)}, lease=${leaseHours ?? 'unreported'}h)`);
       this.logConnectionCounter('after connect');
       this.notifyStatusChange();
       return this.currentSession;
@@ -881,6 +905,7 @@ class VPNService {
     // disconnect() has already returned is still correctly recognized as user-initiated, not
     // an unexpected drop — reset only at the start of the next connect().
     this.userInitiatedDisconnect = true;
+    this.reconnectGaveUp = false;
     clearTimeout(this._reconnectTimer);
     this._reconnectTimer = null;
     this.isReconnecting = false;
@@ -930,6 +955,8 @@ class VPNService {
    */
   _handleUnexpectedDrop() {
     log.info('VPN: Unexpected tunnel disconnect — clearing stale session');
+    this._lastAttemptServerSide = false;
+    this._reconnectExcluded.clear();
 
     const staleSessionId = this.currentSession?.sessionId;
     const serverId = this.currentServerId;
@@ -976,6 +1003,7 @@ class VPNService {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       this.isReconnecting = false;
       log.error(`VPN: Reconnection failed after ${this.maxReconnectAttempts} attempts`);
+      this.reconnectGaveUp = true;
       if (this.currentSession?.sessionId) {
         this.cleanupOrphanedSession(this.currentSession.sessionId, 'reconnect attempts exhausted');
       }
@@ -1004,20 +1032,27 @@ class VPNService {
         // released is refused as "device limit"; the release may have been waiting for the network.
         await Promise.race([
           this.retryPendingDisconnects({ immediate: true }),
-          new Promise((resolve) => setTimeout(resolve, 8000)),
+          new Promise((resolve) => setTimeout(resolve, RELEASE_WAIT_MS)),
         ]);
         const token = this._getAuthToken ? this._getAuthToken() : '';
 
-        // The same server keeps failing (rebuilt, down, or removed): with Auto-Connect on, try the
+        // The same server keeps failing (rebuilt, down, or removed): with "Auto-Reconnect to another server" on, try the
         // lowest-latency other server instead. Skipped for organization gateways (a Dedicated IP is
         // tied to its server). Later attempts re-check, so a recovered server is not abandoned for good
         // by one bad moment: the original is tried again only if no alternative can be found.
         let targetServerId = serverId;
-        if (this.reconnectAttempts > FALLBACK_AFTER_ATTEMPTS && this.settings?.autoConnect && !gatewayId) {
+        // Read the saved choice, not the settings captured at connect time: the user may have flipped it since.
+        let switchServers = this.settings?.reconnectToAnotherServer ?? true;
+        try { switchServers = this.configStore?.get('reconnectToAnotherServer', switchServers); } catch { /* keep the captured value */ }
+        // Switch right after the first failure that was the SERVER's fault (retrying it would get the same
+        // answer); for other failures wait until it has failed FALLBACK_AFTER_ATTEMPTS times.
+        const shouldSwitch = this._lastAttemptServerSide || this.reconnectAttempts > FALLBACK_AFTER_ATTEMPTS;
+        if (shouldSwitch && switchServers && !gatewayId) {
           try {
-            const alternative = await this._pickFallbackServerId(serverId, token);
+            this._reconnectExcluded.add(serverId);
+            const alternative = await this._pickFallbackServerId(this._reconnectExcluded, token);
             if (alternative) {
-              log.warn(`VPN: ${serverId} failed ${this.reconnectAttempts - 1} times, trying ${alternative} instead`);
+              log.warn(`VPN: ${serverId} failed (${this._lastAttemptServerSide ? 'server error' : `${this.reconnectAttempts - 1} attempts`}), trying ${alternative} instead`);
               targetServerId = alternative;
             }
           } catch (pickError) {
@@ -1025,10 +1060,16 @@ class VPNService {
           }
         }
 
+        this._lastTargetServerId = targetServerId;
         await this.connect(targetServerId, this.settings, token, gatewayId);
         // Success: connect() already reset isReconnecting/reconnectAttempts/connectedSince.
+        this._lastAttemptServerSide = false;
+        this._reconnectExcluded.clear();
       } catch (err) {
         log.warn(`VPN: Reconnect attempt ${this.reconnectAttempts} failed: ${err.message}`);
+        this._lastAttemptServerSide = !!(err && err.serverSide);
+        // A server that failed on its own is not tried again during this reconnect.
+        if (this._lastAttemptServerSide && this._lastTargetServerId) this._reconnectExcluded.add(this._lastTargetServerId);
         if (err instanceof UnauthorizedError) {
           // The login expired while away. Retrying cannot fix that: stop, and let the app send the
           // user back to sign-in (see authExpired in the status).
@@ -1052,7 +1093,7 @@ class VPNService {
    * The lowest-latency active server other than the one that keeps failing, or null when none can
    * be reached. Needs the backend (the server list), so it only helps while the network is open.
    */
-  async _pickFallbackServerId(failedServerId, token) {
+  async _pickFallbackServerId(excludedServerIds, token) {
     const response = await apiRelay.apiFetch(`${this.apiBaseUrl}/vpn/servers`, {
       method: 'GET',
       headers: { Authorization: `Bearer ${token}` },
@@ -1063,7 +1104,7 @@ class VPNService {
     const list = await response.json();
     // Plain servers only: organization gateway entries repeat a node's id with a gatewayId.
     const candidates = (Array.isArray(list) ? list : [])
-      .filter(s => s && s.id && s.host && !s.gatewayId && s.id !== failedServerId)
+      .filter(s => s && s.id && s.host && !s.gatewayId && !excludedServerIds.has(s.id))
       .map(s => ({ id: s.id, host: s.host }));
     if (candidates.length === 0) return null;
 
@@ -1115,7 +1156,8 @@ class VPNService {
         advancedKillSwitchEnabled: status.advancedKillSwitchEnabled || false,
         advancedKillSwitchActive: status.advancedKillSwitchActive || false,
         isReconnecting: this.isReconnecting,
-        authExpired: this.authExpired
+        authExpired: this.authExpired,
+        reconnectGaveUp: this.reconnectGaveUp
       };
     } catch (error) {
       // Service pipe not connected yet — return disconnected state
@@ -1126,7 +1168,8 @@ class VPNService {
         advancedKillSwitchEnabled: false,
         advancedKillSwitchActive: false,
         isReconnecting: this.isReconnecting,
-        authExpired: this.authExpired
+        authExpired: this.authExpired,
+        reconnectGaveUp: this.reconnectGaveUp
       };
     }
   }

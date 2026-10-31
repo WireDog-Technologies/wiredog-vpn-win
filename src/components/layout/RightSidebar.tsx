@@ -15,11 +15,15 @@ import { useRecommendedServers } from '@/hooks/useServers';
 import { cn } from '@/lib/utils';
 import ReconnectDialog from '@/components/ReconnectDialog';
 import DisconnectDialog from '@/components/DisconnectDialog';
+import { openPricingPage } from "@/lib/api";
+import { shouldOfferSubscription } from "@/lib/account";
 import Logo from "../../assets/logos/wiredog-minimal-navy_1024x1024.png";
 import TextLogo from "../../assets/logos/wiredog_text_logo_1024.png";
 
 const RightSidebar: React.FC = () => {
-  const { connection, connect, cancelConnect, disconnect, reconnect, settings, updateSettings, selectedServer, advancedKillSwitchActive, isSubscriptionActive, isSwitchingServer } = useVPN();
+  const { user, connection, connect, cancelConnect, disconnect, reconnect, settings, updateSettings, selectedServer, advancedKillSwitchActive, isSubscriptionActive, isSwitchingServer } = useVPN();
+  // Personal accounts without a plan are sent to the website to pick one; organization accounts are not.
+  const offerSubscription = shouldOfferSubscription(user, isSubscriptionActive);
   const [showReconnectDialog, setShowReconnectDialog] = useState(false);
   const [showGuardianReconnectDialog, setShowGuardianReconnectDialog] = useState(false);
   const [guardianReconnectMessage, setGuardianReconnectMessage] = useState('');
@@ -76,6 +80,11 @@ const RightSidebar: React.FC = () => {
   }, [isConnected, connection.sessionStart]);
 
   const handleConnect = async () => {
+    // No active plan: there is nothing to connect with, so send them to pick one (signed in).
+    if (!isConnected && !isConnecting && !isError && offerSubscription) {
+      await openPricingPage();
+      return;
+    }
     if (isConnecting) {
       await cancelConnect();
       return;
@@ -156,16 +165,16 @@ const RightSidebar: React.FC = () => {
         <div className="flex justify-center mb-4">
           <button
             onClick={handleConnect}
-            disabled={!isConnecting && !isConnected && !isSubscriptionActive}
-            title={isConnecting ? 'Cancel connecting' : undefined}
+            disabled={!isConnecting && !isConnected && !isSubscriptionActive && !offerSubscription}
+            title={isConnecting ? 'Cancel connecting' : !isConnected && !isError && offerSubscription ? 'Choose a plan' : undefined}
             className={cn(
               "relative w-28 h-28 rounded-full flex items-center justify-center transition-all duration-300 group",
               "border-4",
               isConnected && "border-connection-active bg-connection-active/10 glow-effect-green",
               isConnecting && "border-connection-connecting bg-connection-connecting/10 glow-effect-gold cursor-pointer",
               isError && "border-red-500 bg-red-500/10",
-              !isConnected && !isConnecting && !isError && isSubscriptionActive && "border-accent bg-accent/10 hover:bg-accent/20",
-              !isConnected && !isConnecting && !isError && !isSubscriptionActive && "border-border bg-muted/20 cursor-not-allowed"
+              !isConnected && !isConnecting && !isError && (isSubscriptionActive || offerSubscription) && "border-accent bg-accent/10 hover:bg-accent/20",
+              !isConnected && !isConnecting && !isError && !isSubscriptionActive && !offerSubscription && "border-border bg-muted/20 cursor-not-allowed"
             )}
           >
             <div className={cn(

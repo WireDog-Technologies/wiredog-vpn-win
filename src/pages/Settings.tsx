@@ -35,6 +35,7 @@ const Settings: React.FC = () => {
       protocol: 'wireguard',
       killSwitch: false,
       autoConnect: false,
+      reconnectToAnotherServer: true,
       splitTunneling: { enabled: false, mode: 'exclude', apps: [], ips: [] },
       ipv6Enabled: true,
       ipv6LeakProtection: true,
@@ -118,7 +119,7 @@ const Settings: React.FC = () => {
 
             <Separator />
 
-            {/* Auto-Connect & Auto-Startup - Clickable Card */}
+            {/* Connection Options (startup, auto-connect, auto-reconnect) - Clickable Card (opens /settings/connection) */}
             <button
               onClick={() => navigate('/settings/connection')}
               className="w-full flex items-center justify-between p-3 -m-3 rounded-lg hover:bg-muted/50 transition-colors"
@@ -128,8 +129,8 @@ const Settings: React.FC = () => {
                   <TbPlugConnected className="w-5 h-5 text-muted-foreground" />
                 </div>
                 <div className="text-left">
-                  <p className="font-medium leading-tight">Auto-Startup</p>
-                  <p className="text-sm text-muted-foreground leading-tight">Set WireDog to open or connect on startup automatically</p>
+                  <p className="font-medium leading-tight">Connection Options</p>
+                  <p className="text-sm text-muted-foreground leading-tight">Choose how WireDog starts, connects, and reconnects</p>
                 </div>
               </div>
               <ChevronLeft className="w-5 h-5 text-muted-foreground rotate-180" />

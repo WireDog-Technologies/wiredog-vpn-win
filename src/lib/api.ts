@@ -14,6 +14,7 @@ const FETCH_TIMEOUT_MS = 15_000;
 // error, asks the main process to send the same request through the relay. HTTP error statuses are
 // real answers and are never retried.
 const RECENT_FAILURE_MS = 60_000;
+const DIRECT_RETRY_DELAY_MS = 1500;
 let apiBlockedHint = false;
 let lastDirectFailureAt = 0;
 
@@ -56,14 +57,31 @@ async function apiFetch(url: string, init: RequestInit = {}): Promise<Response> 
   if (relayFirst) {
     const viaRelay = await requestViaRelay(url, init);
     if (viaRelay) return viaRelay;
+    // The relay did not help (for example the network is still coming back after a wake-up): stop
+    // preferring it, so the next request goes direct first.
+    lastDirectFailureAt = 0;
   }
 
   try {
     const response = await fetch(url, init);
     lastDirectFailureAt = 0;
     return response;
-  } catch (err) {
+  } catch (firstErr) {
+    let err: unknown = firstErr;
     if (!isNetworkFailure(err)) throw err;
+    // A request that fails at once (not a timeout) is often just the tunnel coming up or going down.
+    // Retry the direct path once before using the relay, which keeps the relay out of ordinary traffic.
+    if (!relayFirst && err instanceof TypeError) {
+      await new Promise(resolve => setTimeout(resolve, DIRECT_RETRY_DELAY_MS));
+      try {
+        const response = await fetch(url, init);
+        lastDirectFailureAt = 0;
+        return response;
+      } catch (secondErr) {
+        if (!isNetworkFailure(secondErr)) throw secondErr;
+        err = secondErr;
+      }
+    }
     lastDirectFailureAt = Date.now();
     if (!relayFirst) {
       const viaRelay = await requestViaRelay(url, init);
@@ -102,6 +120,8 @@ interface MeResponse {
   organizationName?: string | null;
   organizationRole?: string | null;
   organizationAccess?: string | null;
+  // Why this account cannot start a free trial (null = it can). Absent on an older backend.
+  trialIneligibleReason?: string | null;
 }
 
 // Unknown values decode as 'active' so a future backend state never locks someone out.
@@ -305,13 +325,15 @@ export async function resetPassword(email: string, code: string, newPassword: st
 
 // MARK: Dashboard handoff
 
+// The website's plan picker. "Get a subscription" and a Connect press without an active plan open it.
+const PRICING_URL = `${import.meta.env.VITE_FRONTEND_URL || 'https://wiredogvpn.com'}/pricing`;
+
 /**
  * Builds a URL that opens the website already signed in: mints a one-time handoff code and puts
  * it in the URL fragment (never sent to a server in a request line or logged by one). Falls back
  * to the plain URL, which asks the user to sign in, if the code can't be issued.
  */
-export async function dashboardHandoffUrl(): Promise<string> {
-  const destination = DASHBOARD_URL;
+async function handoffUrl(destination: string): Promise<string> {
   try {
     const headers = await getHeaders();
     const response = await apiFetch(`${API_URL}/auth/handoff-token`, {
@@ -326,6 +348,20 @@ export async function dashboardHandoffUrl(): Promise<string> {
     return url.toString();
   } catch {
     return destination;
+  }
+}
+
+export function dashboardHandoffUrl(): Promise<string> {
+  return handoffUrl(DASHBOARD_URL);
+}
+
+/** Opens the website's pricing page in the browser, already signed in. */
+export async function openPricingPage(): Promise<void> {
+  const url = await handoffUrl(PRICING_URL);
+  if (window.electronAPI?.openExternal) {
+    window.electronAPI.openExternal(url);
+  } else {
+    window.open(url, '_blank');
   }
 }
 
