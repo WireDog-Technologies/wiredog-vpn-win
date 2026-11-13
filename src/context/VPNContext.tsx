@@ -1,8 +1,10 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, useRef, ReactNode } from 'react';
-import { ConnectionInfo, VPNSettings, ServerLocation, User } from '@/types/vpn';
+import { ConnectionInfo, VPNSettings, ServerLocation, User, getConnectServerId } from '@/types/vpn';
 import * as api from '@/lib/api';
-import { getServerById } from '@/data/servers';
-import type { MeResponse } from '@/lib/api';
+import { getCachedServerById as getServerById } from '@/lib/serverCache';
+import type { MeResponse, LoginOutcome } from '@/lib/api';
+import { transformServer, listIdFor } from '@/lib/servers';
+import { hasEntitlement, lostOrganizationAccess, organizationAccessMessage } from '@/lib/account';
 
 interface VPNContextType {
   connection: ConnectionInfo;
@@ -12,6 +14,9 @@ interface VPNContextType {
   isSwitchingServer: boolean;
   isAuthenticated: boolean;
   isAuthLoading: boolean;
+  // False until the first tunnel-status read has landed, so nothing (e.g. an IP lookup) assumes
+  // "disconnected" while the app was actually relaunched with the tunnel already up.
+  isStatusResolved: boolean;
   isSubscriptionActive: boolean;
   advancedKillSwitchActive: boolean;
   connectionError: string | null;
@@ -22,8 +27,13 @@ interface VPNContextType {
   updateSettings: (settings: Partial<VPNSettings>) => void;
   setSelectedServer: (server: ServerLocation | null) => void;
   selectServer: (server: ServerLocation) => void;
-  login: (email: string, password: string) => Promise<void>;
-  anonymousLogin: (accountNumber: string) => Promise<void>;
+  login: (email: string, password: string) => Promise<LoginOutcome>;
+  anonymousLogin: (accountNumber: string) => Promise<LoginOutcome>;
+  verifyTwoFactor: (challengeToken: string, code: string) => Promise<void>;
+  signInWithSso: (email: string) => Promise<void>;
+  cancelSso: () => Promise<void>;
+  changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
+  refreshUser: () => Promise<void>;
   logout: () => void;
   clearConnectionError: () => void;
 }
@@ -59,6 +69,7 @@ const defaultSettings: VPNSettings = {
   permanentKillSwitch: false,
   autoConnect: false,
   autoReconnect: false, // No longer user-configurable; auto-reconnect is always-on when kill switch active
+  reconnectToAnotherServer: true,
   splitTunneling: defaultSplitTunneling,
   ipv6Enabled: true,
   ipv6LeakProtection: true,
@@ -68,12 +79,9 @@ const defaultSettings: VPNSettings = {
 
 const VPNContext = createContext<VPNContextType | undefined>(undefined);
 
-function checkSubscriptionActive(user: User | null): boolean {
-  if (!user) return false;
-  if (user.subscriptionTier === 'free') return false;
-  if (user.subscriptionExpiry && user.subscriptionExpiry < new Date()) return false;
-  return true;
-}
+// hasEntitlement, not a bare tier/expiry check: an organization seat can have no expiry date of
+// its own, and its access is carried by /auth/me's isActive instead.
+const checkSubscriptionActive = hasEntitlement;
 
 // Map backend /me response to frontend User type
 function mapMeResponseToUser(me: MeResponse): User {
@@ -86,8 +94,27 @@ function mapMeResponseToUser(me: MeResponse): User {
     billingPeriod: me.billingPeriod,
     subscriptionStarted: me.subscriptionStartedAt ? new Date(me.subscriptionStartedAt) : undefined,
     subscriptionExpiry: me.subscriptionExpiresAt ? new Date(me.subscriptionExpiresAt) : undefined,
+    isActive: me.isActive,
+    totpEnabled: me.totpEnabled ?? false,
+    twoFactorRequiredByOrg: me.twoFactorRequiredByOrg ?? false,
+    mustChangePassword: me.mustChangePassword ?? false,
+    subscriptionManagedByOrganization: me.subscriptionManagedByOrganization ?? false,
+    organizationName: me.organizationName ?? undefined,
+    organizationRole: me.organizationRole ?? undefined,
+    organizationAccess: api.parseOrganizationAccess(me.organizationAccess),
+    trialIneligibleReason: me.trialIneligibleReason,
+    revoked: !!me.revokedReason,
   };
 }
+
+// How often a window-focus event may trigger a profile refresh.
+const PROFILE_REFRESH_MIN_INTERVAL_MS = 15_000;
+// Background refresh while signed in, so an expiry or an organization revocation is caught even
+// when the window is hidden in the tray and never gets a focus event. Jittered so clients spread out.
+const PROFILE_POLL_INTERVAL_MS = 5 * 60_000;
+const PROFILE_POLL_JITTER_MS = 60_000;
+// setTimeout silently misbehaves above 2^31-1 ms (~24.8 days); longer waits are re-armed in chunks.
+const MAX_TIMER_MS = 2_147_483_647;
 
 export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [connection, setConnection] = useState<ConnectionInfo>(defaultConnection);
@@ -100,8 +127,15 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   // connected/disconnected values connection.status genuinely passes through.
   const [isSwitchingServer, setIsSwitchingServer] = useState(false);
   const [isAuthLoading, setIsAuthLoading] = useState(true);
+  const [isStatusResolved, setIsStatusResolved] = useState(false);
   const [advancedKillSwitchActive, setAdvancedKillSwitchActive] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
+
+  // While a kill switch is holding the network blocked (no tunnel), backend requests go through the
+  // Rescue Relay first instead of waiting out a direct attempt that cannot succeed.
+  useEffect(() => {
+    api.setApiBlockHint(connection.status !== 'connected' && (connection.status === 'error' || advancedKillSwitchActive));
+  }, [connection.status, advancedKillSwitchActive]);
   const clearConnectionError = useCallback(() => setConnectionError(null), []);
 
   // Load settings from electron-store on mount
@@ -130,12 +164,21 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }
     };
 
-    // Check for existing session on mount
+    // Check for existing session on mount. Only a rejected token (401) means "not signed in": a
+    // network blip or a 5xx at launch is retried a few times first, so a valid session isn't
+    // dropped to the login screen just because the backend was briefly unreachable.
     const checkAuth = async () => {
       try {
-        const me = await api.getCurrentUser();
-        if (me) {
-          setUser(mapMeResponseToUser(me));
+        const token = await window.electronAPI?.auth?.getToken?.();
+        if (!token && window.electronAPI?.auth) return;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            setUser(mapMeResponseToUser(await api.fetchCurrentUser()));
+            return;
+          } catch (error) {
+            if ((error as api.ApiError)?.status === 401 || (error as api.ApiError)?.status === 403) return;
+            if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+          }
         }
       } catch {
         // Not authenticated, that's fine
@@ -156,7 +199,7 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
             setConnection({
               status: 'connected',
               server: fullServer || status.session.server || null,
-              ipAddress: status.session.server?.exitIp || status.session.assignedIp || status.session.server?.ipAddress || '',
+              ipAddress: status.session.publicIp || '',
               sessionStart: status.session.connectedAt ? new Date(status.session.connectedAt) : new Date(),
               dataIn: 0,
               dataOut: 0,
@@ -197,11 +240,46 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setConnectionError('Your session has expired. Please sign in again.');
   }, []);
 
+  const disconnect = useCallback(async (options?: { disableProtection?: boolean }) => {
+    setConnection(prev => ({ ...prev, status: 'connecting' }));
+
+    try {
+      if (window.electronAPI?.vpn) {
+        await window.electronAPI.vpn.disconnect(options);
+      } else {
+        // Mock for browser development
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      setConnection(defaultConnection);
+    } catch (error) {
+      console.error('VPN disconnect failed:', error);
+      setConnection(defaultConnection);
+    }
+  }, []);
+
+  // The account lost its right to the service (plan lapsed, organization seat removed, account
+  // revoked): drop the tunnel AND every block, including the permanent kill switch and its saved
+  // setting, so the app can never leave the machine cut off from the internet. The user can still
+  // reach the website to renew or sign in again.
+  const releaseAllProtection = useCallback(async () => {
+    await disconnect({ disableProtection: true });
+    setSettings(prev => ({ ...prev, permanentKillSwitch: false }));
+    window.electronAPI?.setSettings?.({ permanentKillSwitch: false }).catch((error: Error) => {
+      console.error('Failed to save settings:', error);
+    });
+    window.electronAPI?.vpn?.disableAdvancedKillSwitch?.().catch((error: Error) => {
+      console.error('Failed to disable advanced kill switch:', error);
+    });
+  }, [disconnect]);
+
   const connect = useCallback(async (server: ServerLocation, options?: { silent?: boolean }) => {
     setConnectionError(null);
 
     if (!checkSubscriptionActive(user)) {
-      const error = new Error('An active subscription is required to connect.');
+      // An organization used to cover this account and no longer does: say so, rather than
+      // implying a personal plan would fix an employer-side problem.
+      const lost = lostOrganizationAccess(user);
+      const error = new Error(lost ? organizationAccessMessage(lost) : 'An active subscription is required to connect.');
       if (!options?.silent) setConnectionError(error.message);
       throw error;
     }
@@ -212,11 +290,15 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       // Check if running in Electron with VPN support
       if (window.electronAPI?.vpn) {
         // Real Electron VPN connection
-        const result = await window.electronAPI.vpn.connect(server.id, settings);
+        // A gateway entry's list id is composite; the backend takes the node's real id plus the
+        // gateway (named Dedicated IP) separately.
+        const result = await window.electronAPI.vpn.connect(getConnectServerId(server), settings, server.gatewayId);
         setConnection({
           status: 'connected',
           server,
-          ipAddress: result.server?.exitIp || result.assignedIp || result.server?.ipAddress,
+          // The exit IP the backend assigned (shared pool or Dedicated IP). No fallback to the VPN
+          // server's own address: that is not what websites see. Empty shows as "Unknown".
+          ipAddress: result.publicIp || '',
           sessionStart: new Date(result.connectedAt),
           dataIn: 0,
           dataOut: 0,
@@ -250,6 +332,8 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         // Token expired/invalid — force a clean logout instead of leaving the user stuck
         // on a raw "Invalid token" toast while still shown as signed in.
         console.warn('VPN connection failed: session expired, logging out');
+        // Lift any block too, or a revoked user is left signed out behind the permanent kill switch.
+        await releaseAllProtection();
         await handleUnauthorized();
         return;
       }
@@ -259,7 +343,7 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       }
       throw error;
     }
-  }, [settings, user, handleUnauthorized]);
+  }, [settings, user, handleUnauthorized, releaseAllProtection]);
 
   /** Cancels an in-flight connect attempt — a first attempt or an in-progress auto-reconnect. */
   const cancelConnect = useCallback(async () => {
@@ -268,23 +352,6 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       await window.electronAPI.vpn.cancelConnect();
     }
   }, [connection.status]);
-
-  const disconnect = useCallback(async (options?: { disableProtection?: boolean }) => {
-    setConnection(prev => ({ ...prev, status: 'connecting' }));
-
-    try {
-      if (window.electronAPI?.vpn) {
-        await window.electronAPI.vpn.disconnect(options);
-      } else {
-        // Mock for browser development
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
-      setConnection(defaultConnection);
-    } catch (error) {
-      console.error('VPN disconnect failed:', error);
-      setConnection(defaultConnection);
-    }
-  }, []);
 
   const reconnect = useCallback(async () => {
     const currentServer = connection.server;
@@ -367,9 +434,21 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   // Listen for VPN status changes from Electron
   useEffect(() => {
     if (window.electronAPI?.vpn) {
-      const unsubscribe = window.electronAPI.vpn.onStatusChange((status) => {
-        // Note: Do NOT sync killSwitchEnabled from backend — that reflects runtime WFP filter state,
-        // not the user's preference. The setting persists in electron-store and is sent on connect.
+      // Note: Do NOT sync killSwitchEnabled from backend — that reflects runtime WFP filter state,
+      // not the user's preference. The setting persists in electron-store and is sent on connect.
+      const applyStatus = (status: any) => {
+        // The login expired while the app was away and its reconnect could not continue: go back to
+        // sign-in with the usual message instead of leaving a dead tunnel on screen.
+        if (status.authExpired) {
+          // The reconnect has stopped, so nothing is connecting any more: reset the screen too, or it
+          // would stay on 'connecting' after sign-in (a 'disconnected' status is ignored while connecting).
+          setConnection(defaultConnection);
+          // Let the startup auto-connect run again after the user signs back in (only with the
+          // Auto-connect setting on; otherwise nothing connects by itself).
+          autoConnectedForRef.current = null;
+          handleUnauthorized();
+          return;
+        }
         if (status.advancedKillSwitchActive !== undefined) {
           setAdvancedKillSwitchActive(status.advancedKillSwitchActive);
         }
@@ -382,11 +461,19 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           // Smart merge: preserve full server data from connect(), only update IP from backend
           // Look up full server data by ID for boot auto-reconnect scenarios
           const serverId = status.session!.server?.id;
-          const fullServer = serverId ? getServerById(serverId) : null;
+          const lookedUp = serverId ? getServerById(serverId) : null;
+          // A gateway (named Dedicated IP) session keeps its gateway id so the UI can label it.
+          const fullServer = lookedUp && status.session!.gatewayId
+            ? { ...lookedUp, gatewayId: status.session!.gatewayId }
+            : lookedUp;
           setConnection(prev => ({
             status: 'connected',
-            server: prev.server || fullServer || status.session!.server,
-            ipAddress: prev.ipAddress || status.session!.server?.exitIp || status.session!.assignedIp || status.session!.server?.ipAddress || '',
+            // Keep the server the user picked, unless the session is really on a different one (an
+            // automatic move to another server after the first one failed): then show the new one.
+            server: prev.server && (!serverId || prev.server.id === serverId)
+              ? prev.server
+              : (fullServer || status.session!.server),
+            ipAddress: status.session!.publicIp || prev.ipAddress || '',
             sessionStart: prev.sessionStart || (status.session!.connectedAt ? new Date(status.session!.connectedAt) : null),
             dataIn: prev.dataIn,
             dataOut: prev.dataOut,
@@ -409,33 +496,68 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
           // "disconnected" before the connection proceeds. Resetting here would cause
           // the UI to flicker back to UNPROTECTED.
           setConnection(prev => {
-            if (prev.status === 'connecting') return prev;
+            // ...unless the auto-reconnect loop has really given up: then there is nothing left to wait for.
+            // ...or the user cancelled it: the 'disconnected' that follows is final.
+            if (prev.status === 'connecting' && !status.reconnectGaveUp && !status.reconnectCancelled) return prev;
             return defaultConnection;
           });
+          if (status.reconnectGaveUp) {
+            setConnectionError("Couldn't reconnect to WireDog VPN. Check your connection or choose another server.");
+          }
         }
+      };
+
+      const unsubscribe = window.electronAPI.vpn.onStatusChange((status) => {
+        setIsStatusResolved(true);
+        applyStatus(status);
       });
+
+      // Read the current tunnel state once up front. The app can be relaunched with the tunnel
+      // already up; until this lands, "disconnected" is only the default, not a fact.
+      window.electronAPI.vpn.getStatus()
+        .then(status => {
+          if (status) applyStatus(status);
+        })
+        .catch(error => console.warn('Failed to read initial VPN status:', error))
+        .finally(() => setIsStatusResolved(true));
+
       return unsubscribe;
     }
+    setIsStatusResolved(true);
   }, []);
 
-  // Auto-connect on app startup (autoConnect setting or advancedKillSwitchActive)
+  // Auto-connect on app startup, only when the Auto-connect setting is on. Always-on (the persistent block)
+  // does not connect by itself: it only blocks, and the user presses Connect. It must not depend on the
+  // block state either: a "Stay protected" disconnect flips that flag and used to reconnect at once.
+  // Keyed on the account id (not the profile object), so a routine profile refresh never re-triggers it,
+  // and guarded so it runs once per signed-in account.
+  const autoConnectedForRef = useRef<string | null>(null);
   useEffect(() => {
     const attemptAutoConnect = async () => {
       // Only proceed if authenticated, not loading, and disconnected
-      if (!user || isAuthLoading || connection.status !== 'disconnected') return;
+      if (!user || isAuthLoading || !isStatusResolved || connection.status !== 'disconnected') return;
       if (!window.electronAPI?.vpn) return;
 
-      const shouldAutoConnect = settings.autoConnect;
-      const shouldAutoReconnect = advancedKillSwitchActive;
-
-      if (!shouldAutoConnect && !shouldAutoReconnect) return;
+      if (!settings.autoConnect) return;
+      if (autoConnectedForRef.current === user.id) return;
+      autoConnectedForRef.current = user.id;
 
       try {
         const savedSettings = await window.electronAPI.getSettings();
-        const lastServerId = savedSettings?.lastServerId;
+        const lastServerId = savedSettings?.lastServerId as string | undefined;
         if (!lastServerId) return;
+        const lastGatewayId = savedSettings?.lastGatewayId as number | undefined;
 
-        const server = getServerById(lastServerId);
+        // Look the server up in the live list (it carries organization gateway entries too);
+        // the saved copy of the last real list is only a fallback for when the backend can't be reached.
+        const wantedId = listIdFor(lastServerId, lastGatewayId);
+        let server: ServerLocation | undefined;
+        try {
+          server = (await api.getServers()).map(transformServer).find(s => s.id === wantedId);
+        } catch {
+          // fall through to the static list
+        }
+        server = server ?? getServerById(wantedId);
         if (!server) return;
 
         // Small delay to let UI settle
@@ -449,7 +571,7 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     };
 
     attemptAutoConnect();
-  }, [user, isAuthLoading, advancedKillSwitchActive]);
+  }, [user?.id, isAuthLoading, isStatusResolved]);
 
   const updateSettings = useCallback((newSettings: Partial<VPNSettings>) => {
     setSettings(prev => {
@@ -494,17 +616,152 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     });
   }, [connection.status]);
 
-  const login = useCallback(async (email: string, password: string) => {
-    await api.login(email, password);
-    const me = await api.getCurrentUser();
-    if (me) setUser(mapMeResponseToUser(me));
+  // Loads the profile for a freshly signed-in session. Throws if it can't, so the caller shows an
+  // error instead of silently sitting on the login screen.
+  const loadProfileAfterSignIn = useCallback(async () => {
+    setUser(mapMeResponseToUser(await api.fetchCurrentUser()));
   }, []);
 
-  const anonymousLogin = useCallback(async (accountNumber: string) => {
-    await api.anonymousLogin(accountNumber);
-    const me = await api.getCurrentUser();
-    if (me) setUser(mapMeResponseToUser(me));
+  const login = useCallback(async (email: string, password: string): Promise<LoginOutcome> => {
+    const outcome = await api.login(email, password);
+    if (outcome.status === 'signedIn') await loadProfileAfterSignIn();
+    return outcome;
+  }, [loadProfileAfterSignIn]);
+
+  const anonymousLogin = useCallback(async (accountNumber: string): Promise<LoginOutcome> => {
+    const outcome = await api.anonymousLogin(accountNumber);
+    if (outcome.status === 'signedIn') await loadProfileAfterSignIn();
+    return outcome;
+  }, [loadProfileAfterSignIn]);
+
+  /** Second step of a login that returned 'twoFactorRequired'. */
+  const verifyTwoFactor = useCallback(async (challengeToken: string, code: string) => {
+    await api.verifyTwoFactor(challengeToken, code);
+    await loadProfileAfterSignIn();
+  }, [loadProfileAfterSignIn]);
+
+  /**
+   * Runs the whole native SSO flow: browser sign-in at the org's IdP (resolved by the
+   * wiredog://sso callback), then exchanges the one-time code (bound to a PKCE verifier only the
+   * main process holds) for a session.
+   */
+  const signInWithSso = useCallback(async (email: string) => {
+    const trimmed = email.trim();
+    const domain = trimmed.split('@').pop()?.toLowerCase();
+    if (!domain || !window.electronAPI?.sso || !(await api.ssoAvailable(trimmed))) {
+      throw new Error('SSO_NOT_AVAILABLE');
+    }
+    const { code, codeVerifier } = await window.electronAPI.sso.authenticate(domain);
+    await api.exchangeSsoCode(code, codeVerifier);
+    await loadProfileAfterSignIn();
+  }, [loadProfileAfterSignIn]);
+
+  const cancelSso = useCallback(async () => {
+    await window.electronAPI?.sso?.cancel();
   }, []);
+
+  /** Replaces a temporary password; the backend clears mustChangePassword. */
+  const changePassword = useCallback(async (currentPassword: string, newPassword: string) => {
+    await api.changePassword(currentPassword, newPassword);
+    await loadProfileAfterSignIn();
+  }, [loadProfileAfterSignIn]);
+
+  // Re-reads the profile. Only a rejected token signs the user out: if the backend is briefly
+  // unreachable the session is kept and the last-known profile stays.
+  const refreshInFlightRef = useRef(false);
+  const lastRefreshRef = useRef(0);
+  const refreshUser = useCallback(async () => {
+    if (refreshInFlightRef.current) return;
+    refreshInFlightRef.current = true;
+    try {
+      const me = await api.fetchCurrentUser();
+      lastRefreshRef.current = Date.now();
+      setUser(mapMeResponseToUser(me));
+    } catch (error) {
+      if ((error as api.ApiError)?.status === 401) {
+        // The backend no longer recognizes this account (revoked, or the login is gone): a tunnel
+        // that is still up must not outlive it. Tear it down, blocks included, before the token is
+        // cleared. With no tunnel (e.g. only the permanent block is up) nothing is lifted here, so
+        // a user whose login merely expired can still sign back in.
+        if (connectionStatusRef.current !== 'disconnected') {
+          console.warn('Session rejected by backend, disconnecting tunnel');
+          await releaseAllProtection();
+        }
+        await handleUnauthorized();
+      } else {
+        console.warn('Profile refresh failed, keeping session:', error);
+      }
+    } finally {
+      refreshInFlightRef.current = false;
+    }
+  }, [handleUnauthorized, releaseAllProtection]);
+
+  // Keep the profile in step with the account when the user comes back to the window (e.g. after
+  // setting up 2FA or paying on the website). Throttled so focus flapping doesn't hammer /auth/me.
+  const isSignedIn = !!user;
+  useEffect(() => {
+    if (!isSignedIn) return;
+    const onFocus = () => {
+      if (Date.now() - lastRefreshRef.current >= PROFILE_REFRESH_MIN_INTERVAL_MS) {
+        refreshUser();
+      }
+    };
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [isSignedIn, refreshUser]);
+
+  // Periodic refresh while signed in (see PROFILE_POLL_INTERVAL_MS).
+  useEffect(() => {
+    if (!isSignedIn) return;
+    let timer: ReturnType<typeof setTimeout>;
+    const schedule = () => {
+      timer = setTimeout(async () => {
+        await refreshUser();
+        schedule();
+      }, PROFILE_POLL_INTERVAL_MS + (Math.random() * 2 - 1) * PROFILE_POLL_JITTER_MS);
+    };
+    schedule();
+    return () => clearTimeout(timer);
+  }, [isSignedIn, refreshUser]);
+
+  // A personal subscription's end date passes on its own, with no event and no refresh to notice
+  // it. Wake up at the exact moment it lapses: re-read the profile (the backend is the authority,
+  // e.g. a renewal that just went through) and bump a tick so entitlement is re-evaluated against
+  // the clock below. Organization seats carry entitlement in isActive instead, so they have no
+  // date to wait for.
+  const [expiryTick, setExpiryTick] = useState(0);
+  const expiryMs = user && !user.subscriptionManagedByOrganization ? user.subscriptionExpiry?.getTime() : undefined;
+  useEffect(() => {
+    if (expiryMs === undefined) return;
+    const remaining = expiryMs - Date.now();
+    if (remaining <= 0) return;
+    const timer = setTimeout(() => {
+      setExpiryTick(tick => tick + 1);
+      // Only the final wake-up needs the profile re-read; a chunked wait just re-arms.
+      if (remaining <= MAX_TIMER_MS) refreshUser();
+    }, Math.min(remaining, MAX_TIMER_MS) + 500);
+    return () => clearTimeout(timer);
+  }, [expiryMs, expiryTick, refreshUser]);
+
+  // A tunnel that is already up outlives the connect-time subscription check, so every profile
+  // refresh (and the expiry wake-up above) re-checks entitlement and tears the tunnel down if it
+  // has lapsed.
+  const entitlementTeardownRef = useRef(false);
+  useEffect(() => {
+    // A permanent kill switch can hold the block with no tunnel up (status 'disconnected'); that
+    // block must go too once the account has no right to the service.
+    if (connection.status === 'disconnected' && !advancedKillSwitchActive) {
+      entitlementTeardownRef.current = false;
+      return;
+    }
+    if (!user || checkSubscriptionActive(user) || entitlementTeardownRef.current) return;
+    entitlementTeardownRef.current = true;
+    console.warn('Subscription no longer active, disconnecting tunnel and releasing blocks');
+    const lost = lostOrganizationAccess(user);
+    // A revoked account gets the revoked banner instead of the generic message.
+    setConnectionError(user.revoked ? null : lost ? organizationAccessMessage(lost) : 'Your subscription is no longer active.');
+    releaseAllProtection();
+  }, [user, connection.status, advancedKillSwitchActive, expiryTick]);
 
   const logout = useCallback(async () => {
     if (connection.status !== 'disconnected') {
@@ -524,6 +781,7 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         isSwitchingServer,
         isAuthenticated: !!user,
         isAuthLoading,
+        isStatusResolved,
         isSubscriptionActive: checkSubscriptionActive(user),
         advancedKillSwitchActive,
         connectionError,
@@ -536,6 +794,11 @@ export const VPNProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         selectServer,
         login,
         anonymousLogin,
+        verifyTwoFactor,
+        signInWithSso,
+        cancelSso,
+        changePassword,
+        refreshUser,
         logout,
         clearConnectionError,
       }}

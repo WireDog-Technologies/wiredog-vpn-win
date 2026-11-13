@@ -33,8 +33,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // System operations
   openExternal: (url) => ipcRenderer.invoke('system:open-external', url),
 
+  // Rescue Relay: one backend request made by the main process when the renderer's own fetch cannot
+  // reach the backend (a kill switch is blocking). Resolves { ok: false } when no relay answers.
+  relayRequest: (request) => ipcRenderer.invoke('api:relay-request', request),
+
   // Latency measurement
   measureLatency: (servers) => ipcRenderer.invoke('latency:measure-servers', servers),
+
+  // Business SSO (browser sign-in, resolved by the wiredog://sso callback)
+  sso: {
+    authenticate: (domain) => ipcRenderer.invoke('sso:authenticate', domain),
+    cancel: () => ipcRenderer.invoke('sso:cancel'),
+  },
+
+  // Published Privacy Policy / Terms of Service versions
+  getLegalConfig: () => ipcRenderer.invoke('legal:get-config'),
 
   // Split tunneling
   getInstalledApps: () => ipcRenderer.invoke('split-tunnel:get-installed-apps'),
@@ -42,7 +55,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // VPN operations
   vpn: {
-    connect: (serverId, settings) => ipcRenderer.invoke('vpn:connect', { serverId, settings }),
+    connect: (serverId, settings, gatewayId) => ipcRenderer.invoke('vpn:connect', { serverId, settings, gatewayId }),
     cancelConnect: () => ipcRenderer.invoke('vpn:cancel-connect'),
     disconnect: (options) => ipcRenderer.invoke('vpn:disconnect', options),
     getStatus: () => ipcRenderer.invoke('vpn:get-status'),

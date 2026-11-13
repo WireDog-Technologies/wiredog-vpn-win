@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text.Json;
 using WireDog.Service.Firewall;
@@ -36,11 +37,20 @@ public class JsonRpcHandler
     {
         "connect", "disconnect", "emergencyReset",
         "enableKillSwitch", "disableKillSwitch",
-        "enableAdvancedKillSwitch", "disableAdvancedKillSwitch"
+        "enableAdvancedKillSwitch", "disableAdvancedKillSwitch", "setApiRelays"
     };
 
     // Track current server IP for cleanup
     private string? _currentServerIp;
+
+    // Last address each server hostname resolved to. Right after the network returns, DNS can fail for a
+    // while; the tunnel needs an IP (a hostname as the endpoint never works), so reuse the known one.
+    private readonly Dictionary<string, string> _resolvedServerIps = new(StringComparer.OrdinalIgnoreCase);
+
+    // Set when the app takes over a reconnect. While it is recent, a further connection loss must not start
+    // the service's own replay of the old credentials: those were released by the app and can never work.
+    private DateTime _appReconnectSince = DateTime.MinValue;
+    private static readonly TimeSpan AppReconnectOwnership = TimeSpan.FromMinutes(10);
 
     // Auto-reconnect: store last connect params in memory for reconnect on connection drop
     private ConnectParams? _lastConnectParams;
@@ -130,7 +140,7 @@ public class JsonRpcHandler
                 try
                 {
                     var fakeRequest = new JsonRpcRequest { Method = "connect", Params = connectParams };
-                    await HandleConnectAsync(fakeRequest, cts.Token);
+                    await HandleConnectAsync(fakeRequest, cts.Token, keepBlockOnFailure: true);
                     _logger.LogInformation("[BootReconnect] Connected successfully on attempt {Attempt}!", attempt);
                     return;
                 }
@@ -169,15 +179,37 @@ public class JsonRpcHandler
             _connectionState.SetError("Connection lost - reconnecting...");
 
             // Auto-reconnect: always attempt when kill switch is active and we have stored params.
-            // Note: WireGuard's InstallAndStart already stops any stale service,
-            // so we don't need to disconnect here (which would remove the adapter).
+            bool appOwnsReconnect = DateTime.UtcNow - _appReconnectSince < AppReconnectOwnership;
+            if (appOwnsReconnect)
+                _logger.LogInformation("[AutoReconnect] The app is handling the reconnect, not replaying old credentials");
             if (_lastConnectParams != null)
             {
                 var paramsForReconnect = _lastConnectParams;
                 _reconnectCts?.Cancel();
                 _reconnectCts = new CancellationTokenSource();
                 var cts = _reconnectCts;
-                _ = Task.Run(() => AutoReconnectAsync(paramsForReconnect, cts.Token));
+                _ = Task.Run(async () =>
+                {
+                    // Remove the dead tunnel and its routes first. Left in place, its 0.0.0.0/1 + 128.0.0.0/1
+                    // routes capture every packet, including the app's calls to the backend and the Rescue
+                    // Relay, so nothing could reconnect while the block was up. The Bootstrap block stays
+                    // active throughout, so nothing leaks while the routes are gone.
+                    try
+                    {
+                        try { _splitTunnel.DisableAppSplitTunneling(); }
+                        catch (Exception ex) { _logger.LogWarning(ex, "[CONNECTION LOST] App split tunnel cleanup error"); }
+                        try { _splitTunnel.DisableIpSplitTunneling(); }
+                        catch (Exception ex) { _logger.LogWarning(ex, "[CONNECTION LOST] IP split tunnel cleanup error"); }
+                        await _wireGuard.DisconnectAsync(CancellationToken.None);
+                        _logger.LogInformation("[CONNECTION LOST] Dead tunnel removed; block stays up so the app can reach the relay");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "[CONNECTION LOST] Dead tunnel teardown error");
+                    }
+                    if (!appOwnsReconnect)
+                        await AutoReconnectAsync(paramsForReconnect, cts.Token);
+                });
             }
         }
         else
@@ -326,6 +358,8 @@ public class JsonRpcHandler
             "disableKillSwitch" => HandleDisableKillSwitch(),
             "enableAdvancedKillSwitch" => HandleEnableAdvancedKillSwitch(),
             "disableAdvancedKillSwitch" => HandleDisableAdvancedKillSwitch(),
+            "setApiRelays" => HandleSetApiRelays(request),
+            "cancelAutoReconnect" => HandleCancelAutoReconnect(),
             "getDnsFilterStats" => HandleGetDnsFilterStats(),
             "getDiagnostics" => HandleGetDiagnostics(),
             "emergencyReset" => await HandleEmergencyResetAsync(cancellationToken),
@@ -358,11 +392,23 @@ public class JsonRpcHandler
         };
     }
 
-    private async Task<ConnectResult> HandleConnectAsync(JsonRpcRequest request, CancellationToken cancellationToken)
+    // keepBlockOnFailure: set by the service's own reconnect loops. A failed attempt there must not
+    // lift the kill switch (the loop waits before the next try, and the internet would be open for
+    // that whole wait); it re-enters the Bootstrap block instead.
+    private async Task<ConnectResult> HandleConnectAsync(JsonRpcRequest request, CancellationToken cancellationToken, bool keepBlockOnFailure = false)
     {
         if (_connectionState.Current.Status == ConnectionStatus.Connected)
         {
             throw new JsonRpcException(JsonRpcErrorCodes.AlreadyConnected, "Already connected");
+        }
+
+        // A connect arriving from the app carries fresh credentials. If the service is in the middle of
+        // its own auto-reconnect (which replays the old, possibly deleted, credentials), stop that loop
+        // so the two do not race. The loop's own calls pass its token and are left alone.
+        if (_reconnectCts != null && cancellationToken != _reconnectCts.Token)
+        {
+            _logger.LogInformation("[AutoReconnect] New connect request received, stopping the service's own reconnect loop");
+            _reconnectCts.Cancel();
         }
 
         var paramsJson = JsonSerializer.Serialize(request.Params);
@@ -373,6 +419,11 @@ public class JsonRpcHandler
         {
             throw new JsonRpcException(JsonRpcErrorCodes.InvalidParams, "Config is required");
         }
+
+        // If a block is already holding the internet (reconnecting, gave up, or always-on), a failed
+        // attempt, whoever started it, must leave that block up rather than lift it.
+        keepBlockOnFailure |= _killSwitch.State == KillSwitchStateEnum.Bootstrap
+            || _killSwitch.State == KillSwitchStateEnum.PersistentBlock;
 
         _connectionState.SetConnecting(connectParams.ServerId);
 
@@ -412,15 +463,23 @@ public class JsonRpcHandler
             string serverIp = serverHost;
             if (!IPAddress.TryParse(serverHost, out _))
             {
-                // It's a hostname, resolve it to IP
+                // It's a hostname, resolve it to IP.
+                // Flush first: lookups that failed while a block was up (ours, the app's or Windows' own) are
+                // replayed instantly by the Windows DNS Client, so this lookup would fail in a few ms even though
+                // DNS is permitted now (seen on the first Connect after a reboot from the persistent block).
+                FlushDnsCache();
                 _logger.LogInformation("[DNS] Resolving hostname: {Hostname}", serverHost);
+                var dnsWatch = Stopwatch.StartNew();
                 try
                 {
-                    var addresses = await Dns.GetHostAddressesAsync(serverHost, cancellationToken);
+                    using var dnsTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    dnsTimeout.CancelAfter(TimeSpan.FromSeconds(4));
+                    var addresses = await Dns.GetHostAddressesAsync(serverHost, dnsTimeout.Token);
                     var ipv4 = addresses.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork);
                     if (ipv4 != null)
                     {
                         serverIp = ipv4.ToString();
+                        _resolvedServerIps[serverHost] = serverIp;
                         _logger.LogInformation("[DNS] Resolved {Hostname} -> {Ip}", serverHost, serverIp);
 
                         // Now add the VPN server permit with the resolved IP
@@ -436,7 +495,29 @@ public class JsonRpcHandler
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "[DNS] Failed to resolve {Hostname}, using hostname as-is", serverHost);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    _logger.LogWarning(ex, "[DNS] Failed to resolve {Hostname}", serverHost);
+                    _logger.LogWarning("[DNS] Resolve diagnostics: failed after {Ms} ms, resolvers per up adapter: {Resolvers}",
+                        dnsWatch.ElapsedMilliseconds, DescribeResolvers());
+                }
+
+                if (!IPAddress.TryParse(serverIp, out _))
+                {
+                    // A hostname cannot be the tunnel endpoint. Use the last known address, or fail the attempt
+                    // so the next one can try again, instead of building a tunnel that can never connect.
+                    if (_resolvedServerIps.TryGetValue(serverHost, out var knownIp))
+                    {
+                        serverIp = knownIp;
+                        _logger.LogWarning("[DNS] Using the last known address {Ip} for {Hostname}", serverIp, serverHost);
+                        if (connectParams.KillSwitch)
+                        {
+                            _killSwitch.UpdateBootstrapServerPermit(serverIp, serverPort, isTcp: false);
+                        }
+                    }
+                    else
+                    {
+                        throw new InvalidOperationException($"Could not resolve the server address ({serverHost})");
+                    }
                 }
             }
 
@@ -484,6 +565,13 @@ public class JsonRpcHandler
             _logger.LogInformation("[STEP 2/3] Checking WireGuard handshake status...");
             await Task.Delay(2000, cancellationToken); // Give time for handshake
             await _wireGuard.CheckHandshakeStatusAsync(cancellationToken);
+            // A tunnel that never completed a handshake is not connected, whatever the adapter says. Declaring
+            // success here hid a dead tunnel and let the kill switch move on to Connected. Unreadable
+            // counters count as a failure as well (no adapter at all is exactly that case).
+            if (_wireGuard.HasRecentHandshake() != true)
+            {
+                throw new InvalidOperationException("The server did not answer the tunnel handshake");
+            }
 
             // Get tunnel interface index early (needed by both split tunneling and protections)
             var interfaceIndex = await _wireGuard.GetInterfaceIndexAsync(cancellationToken);
@@ -686,22 +774,7 @@ public class JsonRpcHandler
             // Without this, Windows DNS Client may have cached negative results
             // from the brief bootstrap period (when IPv6 was blocked), causing
             // 60-90 second delays on first connect.
-            _logger.LogInformation("[DNS] Flushing DNS resolver cache...");
-            try
-            {
-                var dnsFlush = new System.Diagnostics.Process();
-                dnsFlush.StartInfo.FileName = "ipconfig";
-                dnsFlush.StartInfo.Arguments = "/flushdns";
-                dnsFlush.StartInfo.UseShellExecute = false;
-                dnsFlush.StartInfo.CreateNoWindow = true;
-                dnsFlush.Start();
-                dnsFlush.WaitForExit(5000);
-                _logger.LogInformation("[DNS] DNS cache flushed");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "[DNS] Failed to flush DNS cache (non-fatal)");
-            }
+            FlushDnsCache();
 
             _connectionState.SetConnected(result.AssignedIp, connectParams.ServerId);
 
@@ -738,11 +811,80 @@ public class JsonRpcHandler
             try { _killSwitch.RemovePhysicalInterfacePermit(); } catch { /* best effort */ }
             _killSwitch.DisableDnsLeakProtection();
             _killSwitch.DisableIpv6LeakProtection();
-            _killSwitch.Disable();
+            if (keepBlockOnFailure && connectParams.KillSwitch)
+            {
+                // EnableBootstrap replaces whatever filters exist in one step (and suspends an
+                // always-on persistent block for the next attempt), so there is no open window.
+                var failedEndpoint = connectParams.Config.Endpoint.Split(':');
+                var failedPort = failedEndpoint.Length > 1 && ushort.TryParse(failedEndpoint[1], out var fp) ? fp : (ushort)443;
+                try { _killSwitch.EnableBootstrap(IPAddress.TryParse(failedEndpoint[0], out _) ? failedEndpoint[0] : "", failedPort, isTcp: false); }
+                catch (Exception bootstrapEx)
+                {
+                    _logger.LogError(bootstrapEx, "[AutoReconnect] Could not hold the block after a failed attempt");
+                    _killSwitch.Disable();
+                }
+            }
+            else
+            {
+                _killSwitch.Disable();
+            }
             await _wireGuard.DisconnectAsync(cancellationToken);
 
             throw new JsonRpcException(JsonRpcErrorCodes.ConnectionFailed, ex.Message);
         }
+    }
+
+    // Clears the Windows DNS Client cache (ipconfig /flushdns). Failure is logged and ignored: the connect goes on.
+    private void FlushDnsCache()
+    {
+        _logger.LogInformation("[DNS] Flushing DNS resolver cache...");
+        var watch = Stopwatch.StartNew();
+        try
+        {
+            var dnsFlush = new System.Diagnostics.Process();
+            dnsFlush.StartInfo.FileName = "ipconfig";
+            dnsFlush.StartInfo.Arguments = "/flushdns";
+            dnsFlush.StartInfo.UseShellExecute = false;
+            dnsFlush.StartInfo.CreateNoWindow = true;
+            dnsFlush.Start();
+            dnsFlush.WaitForExit(5000);
+            _logger.LogInformation("[DNS] DNS cache flushed ({Ms} ms)", watch.ElapsedMilliseconds);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[DNS] Failed to flush DNS cache (non-fatal)");
+        }
+    }
+
+    // Counts only (no addresses): which adapters are up, how many resolvers each has, and whether they are
+    // private or public, so a failed lookup can be told apart from "the adapter has no usable resolver".
+    private static string DescribeResolvers()
+    {
+        try
+        {
+            var parts = new List<string>();
+            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (nic.OperationalStatus != OperationalStatus.Up || nic.NetworkInterfaceType == NetworkInterfaceType.Loopback)
+                    continue;
+                var dns = nic.GetIPProperties().DnsAddresses;
+                int priv = dns.Count(a => a.AddressFamily == AddressFamily.InterNetwork && IsPrivateV4(a));
+                int pub = dns.Count(a => a.AddressFamily == AddressFamily.InterNetwork) - priv;
+                int v6 = dns.Count(a => a.AddressFamily == AddressFamily.InterNetworkV6);
+                parts.Add($"{(nic.Name == "WireDog" ? "tunnel" : "physical")}[v4 private={priv} public={pub}, v6={v6}]");
+            }
+            return parts.Count == 0 ? "none up" : string.Join("; ", parts);
+        }
+        catch (Exception ex)
+        {
+            return $"unavailable ({ex.GetType().Name})";
+        }
+    }
+
+    private static bool IsPrivateV4(IPAddress a)
+    {
+        var b = a.GetAddressBytes();
+        return b[0] == 10 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168) || (b[0] == 169 && b[1] == 254);
     }
 
     private async Task<object> HandleDisconnectAsync(JsonRpcRequest request, CancellationToken cancellationToken)
@@ -765,7 +907,21 @@ public class JsonRpcHandler
             return new { success = true };
         }
 
+        // Any disconnect request is the user (or app quit) ending the connection, and the app releases that
+        // session on the backend, so the saved credentials are dead. Keeping them made the next boot replay
+        // them, fail the handshake 4 times and sit yellow for ~2 minutes. The config is saved again on the
+        // next successful connect; it only survives an unexpected stop (power loss, crash, service restart).
+        AutoReconnectConfig.Delete();
+
         // Handle PersistentBlock → disable advanced KS (user wants full disconnect)
+        if (_killSwitch.State == KillSwitchStateEnum.PersistentBlock && !disableProtection)
+        {
+            // Always-on: a plain disconnect keeps the block. Only turning Always-on off lifts it.
+            _logger.LogInformation("[AdvKS] Disconnect from PersistentBlock — keeping the block (protection not disabled)");
+            _connectionState.SetDisconnected();
+            return new { success = true };
+        }
+
         if (_killSwitch.State == KillSwitchStateEnum.PersistentBlock)
         {
             _logger.LogInformation("[AdvKS] Disconnect from PersistentBlock — disabling persistent filters");
@@ -866,12 +1022,6 @@ public class JsonRpcHandler
             _reconnectCts?.Cancel();
             _reconnectCts = null;
             _lastConnectParams = null;
-
-            // Clear persisted config on full disconnect (not when transitioning to PersistentBlock)
-            if (disableProtection)
-            {
-                AutoReconnectConfig.Delete();
-            }
         }
         catch (Exception ex)
         {
@@ -971,6 +1121,38 @@ public class JsonRpcHandler
         return new { success = true, advancedKillSwitchEnabled = true };
     }
 
+    // Rescue Relay addresses (from the backend's /app/config, relayed by the app). Validated and capped
+    // inside KillSwitchManager.SetApiRelays; an empty list switches the relay permits off.
+    private object HandleSetApiRelays(JsonRpcRequest request)
+    {
+        var paramsJson = JsonSerializer.Serialize(request.Params);
+        using var doc = JsonDocument.Parse(paramsJson);
+        var ips = new List<string>();
+        if (doc.RootElement.TryGetProperty("ips", out var ipsElem) && ipsElem.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in ipsElem.EnumerateArray())
+            {
+                if (item.ValueKind == JsonValueKind.String && item.GetString() is { } s) ips.Add(s);
+            }
+        }
+        _killSwitch.SetApiRelays(ips);
+        return new { success = true };
+    }
+
+    // The app is about to reconnect itself with a fresh session, so the service must not replay the old
+    // credentials in parallel: when both succeed, one of them hits "Already connected" and a session is
+    // thrown away. With no app running (boot with Always-on) nothing calls this and the replay stays.
+    private object HandleCancelAutoReconnect()
+    {
+        if (_reconnectCts != null && !_reconnectCts.IsCancellationRequested)
+        {
+            _logger.LogInformation("[AutoReconnect] The app took over the reconnect, stopping the service's own replay");
+            _reconnectCts.Cancel();
+        }
+        _appReconnectSince = DateTime.UtcNow;
+        return new { success = true };
+    }
+
     private object HandleDisableAdvancedKillSwitch()
     {
         _killSwitch.SetAdvancedModeEnabled(false);
@@ -1040,7 +1222,7 @@ public class JsonRpcHandler
             {
                 // Re-run the connect using the stored params (HandleConnectAsync calls SetConnecting internally)
                 var fakeRequest = new JsonRpcRequest { Method = "connect", Params = connectParams };
-                await HandleConnectAsync(fakeRequest, cancellationToken);
+                await HandleConnectAsync(fakeRequest, cancellationToken, keepBlockOnFailure: true);
                 _logger.LogInformation("[AutoReconnect] Reconnect successful on attempt {Attempt}", attempt);
                 return;
             }
@@ -1048,7 +1230,8 @@ public class JsonRpcHandler
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "[AutoReconnect] Attempt {Attempt} failed", attempt);
-                // HandleConnectAsync's catch already called Disable() — next attempt will re-enable bootstrap
+                // keepBlockOnFailure: HandleConnectAsync's catch re-entered the Bootstrap block, so the
+                // internet stays blocked while we wait for the next attempt
             }
         }
 
@@ -1056,7 +1239,9 @@ public class JsonRpcHandler
 
         // Give-up behavior depends on kill switch type:
         // Always-on KS → transition to PersistentBlock (protected, user must manually reconnect)
-        // Standard KS  → full cleanup (restore internet, user is unprotected)
+        // Standard KS  → stay blocked in Bootstrap with an error. The user restores the internet with Disconnect, which does the
+        //                full cleanup (HandleDisconnectAsync). Opening the internet here, unasked,
+        //                would break the promise that a dropped VPN never leaks.
         if (_killSwitch.IsAdvancedModeEnabled)
         {
             _logger.LogInformation("[AutoReconnect] Always-on KS enabled — activating PersistentBlock");
@@ -1065,20 +1250,10 @@ public class JsonRpcHandler
         }
         else
         {
-            _logger.LogInformation("[AutoReconnect] Standard KS — cleaning up to restore internet");
-            try { _splitTunnel.DisableAppSplitTunneling(); } catch { }
-            try { _splitTunnel.DisableIpSplitTunneling(); } catch { }
-            _killSwitch.DisableDnsLeakProtection();
-            _killSwitch.DisableIpv6LeakProtection();
-            _killSwitch.Disable();
-            await _wireGuard.DisconnectAsync(CancellationToken.None);
-            if (_currentServerIp != null)
-            {
-                try { _firewallManager.RemoveServerRule(_currentServerIp); } catch { }
-                _currentServerIp = null;
-            }
-            _lastConnectParams = null;
-            _connectionState.SetDisconnected();
+            _logger.LogInformation("[AutoReconnect] Standard KS — staying blocked until the user disconnects or reconnects");
+            // The last failed attempt already tore down split tunneling and the tunnel and re-entered
+            // Bootstrap; only the state needs to say why the internet is paused.
+            _connectionState.SetError("Auto-reconnect failed — internet paused for protection. Disconnect to restore it.");
         }
     }
 

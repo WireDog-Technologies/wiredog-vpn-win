@@ -1,6 +1,6 @@
 import React from 'react';
 import { ChevronLeft, Monitor } from 'lucide-react';
-import { TbPlugConnected } from 'react-icons/tb';
+import { TbPlugConnected, TbArrowsExchange } from 'react-icons/tb';
 import { useNavigate } from 'react-router-dom';
 import { Switch } from '@/components/ui/switch';
 import { Card } from '@/components/ui/card';
@@ -31,7 +31,7 @@ const SettingsConnection: React.FC = () => {
             CONNECTION
           </h1>
           <p className="text-muted-foreground">
-            Configure auto-startup and auto-connect behavior
+            Configure startup, auto-connect, and auto-reconnect behavior
           </p>
         </div>
 
@@ -91,7 +91,7 @@ const SettingsConnection: React.FC = () => {
         </Card>
 
         {/* Auto-Connect Card */}
-        <Card className="p-4">
+        <Card className="p-4 mb-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-lg bg-muted flex items-center justify-center">
@@ -105,6 +105,25 @@ const SettingsConnection: React.FC = () => {
             <Switch
               checked={settings.autoConnect}
               onCheckedChange={(checked) => updateSettings({ autoConnect: checked })}
+            />
+          </div>
+        </Card>
+
+        {/* Auto-Reconnect Card */}
+        <Card className="p-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-lg bg-muted flex items-center justify-center">
+                <TbArrowsExchange className="w-5 h-5 text-muted-foreground" />
+              </div>
+              <div>
+                <p className="font-medium leading-tight">Auto-Reconnect</p>
+                <p className="text-sm text-muted-foreground leading-tight">Automatically reconnect to another server if your connection fails</p>
+              </div>
+            </div>
+            <Switch
+              checked={settings.reconnectToAnotherServer}
+              onCheckedChange={(checked) => updateSettings({ reconnectToAnotherServer: checked })}
             />
           </div>
         </Card>

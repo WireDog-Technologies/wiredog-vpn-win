@@ -1,8 +1,9 @@
 import React from 'react';
 import { Loader2, ArrowDown, ArrowUp, Server, Activity, Signal } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { ServerLocation } from '@/types/vpn';
+import { ServerLocation, isDedicatedServer } from '@/types/vpn';
 import { getUSStateFlag } from '@/lib/utils';
+import { openPricingPage } from '@/lib/api';
 
 // Parse WireGuard byte strings like "1.5 MiB" to bytes
 const parseWireGuardBytes = (str: string): number => {
@@ -93,6 +94,8 @@ interface BottomToolbarProps {
   isConnecting: boolean;
   connectedServer: ServerLocation | null;
   isSubscriptionActive: boolean;
+  // True for a personal account with no plan: Connect then opens the website's plan picker.
+  offerSubscription: boolean;
   onConnect: () => void;
   onCancelConnect: () => void;
   onDisconnect: () => void;
@@ -110,6 +113,7 @@ const BottomToolbar: React.FC<BottomToolbarProps> = ({
   isConnecting,
   connectedServer,
   isSubscriptionActive,
+  offerSubscription,
   onConnect,
   onCancelConnect,
   onDisconnect,
@@ -157,8 +161,10 @@ const BottomToolbar: React.FC<BottomToolbarProps> = ({
             <Button
               variant="outline"
               size="sm"
-              disabled
-              className="flex-shrink-0 text-xs font-semibold tracking-wide opacity-50 cursor-not-allowed"
+              disabled={!offerSubscription}
+              onClick={() => { void openPricingPage(); }}
+              title={offerSubscription ? 'Choose a plan' : undefined}
+              className={`flex-shrink-0 text-xs font-semibold tracking-wide ${offerSubscription ? '' : 'opacity-50 cursor-not-allowed'}`}
             >
               Connect
             </Button>
@@ -200,7 +206,7 @@ const BottomToolbar: React.FC<BottomToolbarProps> = ({
                 {(displayServer.latency ?? 0) > 0 ? `${displayServer.latency}ms` : '—'}<Signal className="w-2.5 h-2.5" />
               </span>
             </div>
-            <span className="flex items-center gap-1 text-muted-foreground/40">{displayServer.id?.toUpperCase() ?? '---'}<Server className="w-2.5 h-2.5" /></span>
+            <span className="flex items-center gap-1 text-muted-foreground/40"><span className="max-w-[180px] truncate">{isDedicatedServer(displayServer) ? (displayServer.gatewayName ?? 'DEDICATED') : (displayServer.id?.toUpperCase() ?? '---')}</span><Server className="w-2.5 h-2.5" /></span>
           </div>
         </div>
       </div>

@@ -206,6 +206,45 @@ public class WireGuardManager : IDisposable
     /// <summary>
     /// Check WireGuard handshake status
     /// </summary>
+    /// <summary>
+    /// True when the node completed a handshake within the last 3 minutes, false when stats were read and it
+    /// did not, null when the stats could not be read at all (unknown: callers must not treat that as a failure).
+    /// </summary>
+    public bool? HasRecentHandshake()
+    {
+        try
+        {
+            if (_adapter == null || !_adapter.ReadStats()) return null;
+            if (_adapter.LastHandshake == null) return false;
+            return (DateTime.UtcNow - _adapter.LastHandshake.Value).TotalMinutes < 3;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>One line of tunnel counters for the log, to see whether data moves when a probe goes unanswered.</summary>
+    private string DescribeTunnelStats()
+    {
+        try
+        {
+            if (_adapter != null && _adapter.ReadStats())
+            {
+                var handshake = _adapter.LastHandshake == null
+                    ? "never"
+                    : $"{(int)(DateTime.UtcNow - _adapter.LastHandshake.Value).TotalSeconds}s ago";
+                return $"TX {FormatBytes(_adapter.TxBytes)}, RX {FormatBytes(_adapter.RxBytes)}, last handshake {handshake}";
+            }
+        }
+        catch { /* fall through */ }
+        return "stats unavailable";
+    }
+
+    // Servers whose tunnel has answered the data-path probe at least once in this service run. A tunnel to
+    // one of them that stops answering counts as dead even if it never answered since it was last rebuilt.
+    private static readonly HashSet<string> ProbeAnsweredServers = new();
+
     public Task<bool> CheckHandshakeStatusAsync(CancellationToken cancellationToken)
     {
         if (_adapter == null)
@@ -279,17 +318,64 @@ public class WireGuardManager : IDisposable
         int consecutiveFailures = 0;
         const int failureThreshold = 2; // Require 2 consecutive failures (10 seconds) to avoid false positives
 
+        // Sleep detection. The machine sleeping (lid closed, hibernate) freezes this loop, so a gap far
+        // longer than the 5s tick between two checks means the machine just woke up. The handshake is
+        // then stale only because nothing could refresh it, and the network is usually not back yet:
+        // WireGuard re-handshakes on its own once it is. Give it a grace period instead of declaring
+        // the connection lost and tearing down a tunnel that would have recovered.
+        var sleepGapThreshold = TimeSpan.FromSeconds(30);
+        var resumeGracePeriod = TimeSpan.FromSeconds(60);
+        var lastTick = DateTime.UtcNow;
+        var graceUntil = DateTime.MinValue;
+
+        // Data-plane probe. A handshake only goes stale about 2 minutes after the tunnel stops carrying
+        // data, so on its own it notices a dead tunnel late. Every ~10s a tiny DNS question goes through
+        // the tunnel to the node's own resolver; an answer proves the path works both ways. Three misses
+        // in a row (about 30-40s) fire the same ConnectionLost the stale handshake does. It only counts
+        // once the probe has been answered at least once on this tunnel, so a node that does not answer
+        // it can never tear down a healthy connection.
+        var probeTarget = GetProbeTarget(_currentConfig?.Dns);
+        var probeInterval = TimeSpan.FromSeconds(10);
+        const int probeFailureThreshold = 3;
+        var lastProbe = DateTime.UtcNow;
+        var probeFailures = 0;
+        var probeServerKey = _currentConfig?.GetServerIp() ?? "";
+        bool probeEverAnswered;
+        lock (ProbeAnsweredServers) { probeEverAnswered = probeServerKey.Length > 0 && ProbeAnsweredServers.Contains(probeServerKey); }
+        var monitorStart = DateTime.UtcNow;
+        var noAnswerWarned = false;
+        if (probeTarget == null)
+            _logger.LogInformation("[HEALTH] No IPv4 resolver in the tunnel config, data-path probe disabled");
+
         while (!cancellationToken.IsCancellationRequested && IsConnected)
         {
             try
             {
                 await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
 
+                var now = DateTime.UtcNow;
+                if (now - lastTick > sleepGapThreshold)
+                {
+                    graceUntil = now + resumeGracePeriod;
+                    consecutiveFailures = 0;
+                    probeFailures = 0;
+                    _logger.LogInformation("[HEALTH] Resume from sleep detected (gap {Gap}s) â€” holding off health checks for {Grace}s",
+                        (int)(now - lastTick).TotalSeconds, (int)resumeGracePeriod.TotalSeconds);
+                }
+                lastTick = now;
+                var inResumeGrace = now < graceUntil;
+
                 // Check 1: Does the adapter still exist?
                 var interfaces = NetworkInterface.GetAllNetworkInterfaces();
                 var adapterExists = interfaces.Any(i =>
                     i.Name.Equals(_tunnelName, StringComparison.OrdinalIgnoreCase) &&
                     i.OperationalStatus == OperationalStatus.Up);
+
+                if (!adapterExists && inResumeGrace)
+                {
+                    _logger.LogDebug("[HEALTH] Adapter not up yet, still in resume grace period");
+                    continue;
+                }
 
                 if (!adapterExists)
                 {
@@ -307,6 +393,46 @@ public class WireGuardManager : IDisposable
                     continue;
                 }
 
+                // Check 1b: does the tunnel still carry data? (see the probe notes above)
+                if (probeTarget != null && !inResumeGrace && now - lastProbe >= probeInterval)
+                {
+                    lastProbe = now;
+                    if (await ProbeTunnelAsync(probeTarget, cancellationToken))
+                    {
+                        if (!probeEverAnswered)
+                            _logger.LogInformation("[HEALTH] Data-path probe answered by {Target}, now watching the tunnel with it", probeTarget);
+                        probeEverAnswered = true;
+                        if (probeServerKey.Length > 0) lock (ProbeAnsweredServers) { ProbeAnsweredServers.Add(probeServerKey); }
+                        probeFailures = 0;
+                    }
+                    else if (!probeEverAnswered)
+                    {
+                        // Never answered on this tunnel and not known to answer on this server: do not count it,
+                        // but say so once, with the counters, so a tunnel that handshakes and then carries no data
+                        // is visible in the log.
+                        if (!noAnswerWarned && now - monitorStart > TimeSpan.FromSeconds(30))
+                        {
+                            noAnswerWarned = true;
+                            _logger.LogWarning("[HEALTH] Data-path probe has not been answered {Secs}s after connecting ({Stats})",
+                                (int)(now - monitorStart).TotalSeconds, DescribeTunnelStats());
+                        }
+                    }
+                    else
+                    {
+                        probeFailures++;
+                        _logger.LogWarning("[HEALTH] Data-path probe got no answer (failure {Count}/{Threshold}; {Stats})",
+                            probeFailures, probeFailureThreshold, DescribeTunnelStats());
+
+                        if (probeFailures >= probeFailureThreshold)
+                        {
+                            _logger.LogError("[HEALTH] Tunnel stopped carrying data — firing ConnectionLost");
+                            IsConnected = false;
+                            ConnectionLost?.Invoke(this, EventArgs.Empty);
+                            return;
+                        }
+                    }
+                }
+
                 // Check 2: Is the handshake still fresh? (WireGuard sends keepalives every ~25s)
                 bool handshakeFresh = false;
                 try
@@ -320,6 +446,12 @@ public class WireGuardManager : IDisposable
                 catch
                 {
                     // ReadStats can fail if adapter handle is stale
+                }
+
+                if (!handshakeFresh && inResumeGrace)
+                {
+                    _logger.LogDebug("[HEALTH] Handshake stale, still in resume grace period");
+                    continue;
                 }
 
                 if (!handshakeFresh)
@@ -470,6 +602,64 @@ public class WireGuardManager : IDisposable
             }
         }
         return null;
+    }
+
+    /// <summary>First IPv4 address in the tunnel's DNS list: the node's own resolver, reached through the tunnel.</summary>
+    private static System.Net.IPAddress? GetProbeTarget(string? dnsConfig)
+    {
+        if (string.IsNullOrWhiteSpace(dnsConfig))
+            return null;
+        foreach (var part in dnsConfig.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (System.Net.IPAddress.TryParse(part, out var ip) && ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                return ip;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Sends one DNS question (a made-up name under .invalid, which the resolver answers on its own with
+    /// no upstream lookup) to the node's resolver and waits up to 3s for ANY reply. The route to the
+    /// resolver is the tunnel, so a reply proves the tunnel carries data both ways. Nothing the user
+    /// browsed is involved. Any send or receive error counts as no answer.
+    /// </summary>
+    private static async Task<bool> ProbeTunnelAsync(System.Net.IPAddress target, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var udp = new System.Net.Sockets.UdpClient(System.Net.Sockets.AddressFamily.InterNetwork);
+            udp.Connect(target, 53);
+
+            var id = (ushort)Random.Shared.Next(1, ushort.MaxValue);
+            var query = new List<byte> { (byte)(id >> 8), (byte)(id & 0xFF), 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0 };
+            foreach (var label in new[] { "wiredog", "invalid" })
+            {
+                query.Add((byte)label.Length);
+                query.AddRange(System.Text.Encoding.ASCII.GetBytes(label));
+            }
+            query.AddRange(new byte[] { 0x00, 0x00, 0x01, 0x00, 0x01 }); // end of name, type A, class IN
+
+            var bytes = query.ToArray();
+            await udp.SendAsync(bytes, bytes.Length);
+
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(3));
+            var reply = await udp.ReceiveAsync(timeout.Token);
+            var data = reply.Buffer;
+            return data.Length >= 12 && data[0] == (byte)(id >> 8) && data[1] == (byte)(id & 0xFF) && (data[2] & 0x80) != 0;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return false; // no answer within 3s
+        }
+        catch (OperationCanceledException)
+        {
+            throw; // the monitor is being stopped
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private void SetTunnelDns(string dnsConfig)

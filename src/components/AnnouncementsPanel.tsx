@@ -35,7 +35,7 @@ const AnnouncementsPanel: React.FC<AnnouncementsPanelProps> = ({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-border flex-shrink-0">
-          <h3 className="font-display text-lg tracking-wide text-foreground">Announcements</h3>
+          <h3 className="font-display text-lg tracking-wide text-foreground">Messages</h3>
           <button
             onClick={onClose}
             className="text-muted-foreground hover:text-foreground transition-colors"
@@ -49,7 +49,7 @@ const AnnouncementsPanel: React.FC<AnnouncementsPanelProps> = ({
           {messages.length === 0 ? (
             <div className="flex flex-col items-center gap-3 py-12 text-center">
               <Mail className="w-9 h-9 text-muted-foreground" />
-              <p className="text-sm text-muted-foreground">No announcements right now</p>
+              <p className="text-sm text-muted-foreground">No messages right now</p>
             </div>
           ) : (
             messages.map((message) => {

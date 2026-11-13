@@ -1,37 +1,29 @@
 import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { getServers, ServerResponse } from '@/lib/api';
+import { getServers } from '@/lib/api';
+import { transformServer } from '@/lib/servers';
+import { useVPN } from '@/context/VPNContext';
 import { ServerLocation } from '@/types/vpn';
-import { servers as fallbackServers } from '@/data/servers';
+import { loadCachedServers, saveCachedServers } from '@/lib/serverCache';
 import { useLatency } from '@/hooks/useLatency';
 
-// Transform backend response to frontend ServerLocation type
-function transformServer(server: ServerResponse): ServerLocation {
-  return {
-    id: server.id,
-    state: server.state,
-    stateCode: server.stateCode,
-    city: server.city,
-    latitude: server.latitude ?? 0,
-    longitude: server.longitude ?? 0,
-    latency: server.latency,
-    load: server.load,
-    recommended: server.isRecommended,
-    host: server.host,
-  };
-}
-
 export function useServers() {
+  // The list depends on who is signed in: an organization member gets named Dedicated IP gateway
+  // entries, and may be restricted to the organization's own network. Keying the query on the
+  // account refetches it whenever the signed-in account changes (sign-in, sign-out).
+  const { user } = useVPN();
   return useQuery({
-    queryKey: ['vpn-servers'],
+    queryKey: ['vpn-servers', user?.id ?? 'signed-out'],
+    // The last real list, if any, shows at once and is refreshed right away.
+    initialData: () => loadCachedServers(user?.id),
+    initialDataUpdatedAt: 0,
     queryFn: async () => {
-      try {
-        const servers = await getServers();
-        return servers.map(transformServer);
-      } catch {
-        // API unavailable, use fallback servers
-        return fallbackServers;
-      }
+      // An empty list is a real answer (a business plan restricted to the organization's own
+      // network with no location set up). A failure is NOT turned into a made-up list: it throws, so
+      // the list already on screen (or saved) stays as it is.
+      const servers = (await getServers()).map(transformServer);
+      if (user?.id) saveCachedServers(user.id, servers);
+      return servers;
     },
     staleTime: 5 * 60 * 1000, // 5 minutes
     retry: false, // Don't retry if API fails

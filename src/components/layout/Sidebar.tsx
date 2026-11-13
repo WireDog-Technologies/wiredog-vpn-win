@@ -15,7 +15,7 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from '@/components/ui/accordion';
-import { ServerLocation, User } from '@/types/vpn';
+import { ServerLocation, User, isDedicatedServer } from '@/types/vpn';
 
 // Helper: Load favorites from localStorage
 const loadFavorites = (): string[] => {
@@ -101,6 +101,7 @@ const filterHierarchy = (
           const cityMatches = city.cityName.toLowerCase().includes(lowerQuery);
           const filteredServers = city.servers.filter(server =>
             stateMatches || cityMatches || server.id.toLowerCase().includes(lowerQuery)
+              || (server.gatewayName?.toLowerCase().includes(lowerQuery) ?? false)
           );
           return filteredServers.length > 0 ? { ...city, servers: filteredServers } : null;
         })
@@ -225,7 +226,7 @@ const Sidebar: React.FC = () => {
           <button
             onClick={() => setShowAnnouncements(true)}
             className="relative flex-shrink-0"
-            title="Announcements"
+            title="Messages"
           >
             <Bell className="w-5 h-5 text-muted-foreground hover:text-foreground transition-colors cursor-pointer" />
             {unreadCount > 0 && (
@@ -322,13 +323,16 @@ const Sidebar: React.FC = () => {
                           {/* Server ID and City */}
                           <div className="flex-1 min-w-0">
                             <div className={cn(
-                              "text-sm truncate font-mono",
+                              // Server ids are monospace; a gateway's name is free text, and the
+                              // wide monospace face spreads its words too far apart.
+                              "text-sm truncate",
+                              !server.gatewayName && "font-mono",
                               isConnected ? "text-foreground" : isSelected ? "text-patriot-gold" : "text-foreground"
-                            )}>{server.id}</div>
+                            )}>{server.gatewayName ?? server.id}</div>
                             <div className={cn(
                               "text-xs truncate",
                               isConnected ? "text-foreground" : isSelected ? "text-muted-foreground" : "text-muted-foreground"
-                            )}>{server.cityName}</div>
+                            )}>{isDedicatedServer(server) ? `Dedicated Gateway · ${server.cityName}` : server.cityName}</div>
                           </div>
 
                           {/* Load + Latency badges */}
@@ -354,7 +358,11 @@ const Sidebar: React.FC = () => {
           </Accordion>
         ) : (
           <div className="flex items-center justify-center py-8">
-            <p className="text-sm text-muted-foreground">No servers found</p>
+            <p className="text-sm text-muted-foreground text-center px-4">
+              {servers.length === 0 && user
+                ? "No locations are available for your account yet. If you're on a business plan, contact your organization's administrator."
+                : 'No servers found'}
+            </p>
           </div>
         )}
       </nav>

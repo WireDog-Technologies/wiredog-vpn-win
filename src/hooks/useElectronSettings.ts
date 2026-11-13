@@ -7,7 +7,7 @@ import { useState, useEffect } from 'react';
 export const useElectronSettings = () => {
   const { getSettings, setSettings, isElectron } = useElectron();
   const [settings, setSettingsState] = useState({
-    autoStart: false,
+    autoStart: true,
     autoStartMode: 'open' as 'open' | 'minimize',
     killSwitch: true,
     notifications: true,

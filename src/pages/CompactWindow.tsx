@@ -113,11 +113,11 @@ const CompactWindow: React.FC = () => {
     ? 'Loading...'
     : isConnected
       ? connection.server
-        ? `${connection.server.city}, ${connection.server.stateCode}`
+        ? (connection.server.gatewayName ?? `${connection.server.city}, ${connection.server.stateCode}`)
         : 'Connected'
       : geo?.city ? `${geo.city}, ${geo.region}` : 'Redacted';
 
-  const displayIP = isTransitioning ? 'Loading...' : isConnected ? (connection.ipAddress || 'Redacted') : (geo?.ip || 'Redacted');
+  const displayIP = isTransitioning ? 'Loading...' : isConnected ? (connection.ipAddress || 'Unknown') : (geo?.ip || 'Redacted');
 
   // Handle server connect (from list)
   const handleServerConnect = async (server: ServerLocation) => {
